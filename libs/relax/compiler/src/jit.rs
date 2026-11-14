@@ -828,12 +828,18 @@ pub struct CodeTables {
     /// glue that calls out with a frame record (lazy and hot entries, `enter`, the TLS slow path,
     /// register-block trampolines): (start, len, fp - sp at its call), for walks from sp alone
     glue: Vec<(u64, u32, u32)>,
+    /// the code starts of twins' bodies (a sandboxed module's code, `FnKey::Sandbox`): an unwind
+    /// cut at a module's edge walks past their landings (unwind_walk)
+    twins: std::collections::HashSet<u64>,
 }
 
 impl CodeTables {
-    fn add(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>, kind: CodeKind) {
+    fn add(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>, kind: CodeKind, twin: bool) {
         // identity state (panics and faults walk it): the tables are the program's
         let _k = crate::zone_alloc::kept();
+        if twin {
+            self.twins.insert(at);
+        }
         if let Some(i) = unwind {
             let own = relax_backend::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off, staged: i.staged.clone() };
             self.unwind.insert(at, own);
@@ -853,6 +859,11 @@ impl CodeTables {
         self.index.reserve(n);
         self.kinds.reserve(n);
         self.image_unwind.reserve(n);
+    }
+
+    /// Whether the code body that starts at `start` is a twin's (a sandboxed module's code).
+    pub fn is_twin(&self, start: u64) -> bool {
+        self.twins.contains(&start)
     }
 
     /// The kind of the code body that starts at `start`.
@@ -3641,6 +3652,11 @@ thread_local! {
     /// is running on this thread; 0 = none. A panic raised while it runs, under the same
     /// recovery point, is a panic during cleanup: rustc aborts (panic_in_cleanup).
     static CLEANING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// the cleanup running (CLEANING) is a sandboxed module's: its landing was in a twin's code
+    static CLEANING_TWIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// the walk that starts next is cut at a module's edge: it walks past the twins' landings to
+    /// the first frame of host code (a panic was raised in a module's cleanup)
+    static CUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A panic from JIT code (panic trampoline): the report as `raise` makes it, then the frames'
@@ -3648,6 +3664,17 @@ thread_local! {
 fn raise_unwinding(kind: &str, message: String, site: u64, regs: *const u64) -> ! {
     let (rbp, ret) = unsafe { (*regs, *regs.add(1)) };
     let ctx = unsafe { *ctx_ptr() };
+    if ctx != 0 && CLEANING.with(|c| c.get()) == ctx && CLEANING_TWIN.with(|c| c.get()) {
+        // a sandboxed module's cleanup panicked: a panic of its own, or a stop (its fuel ran out
+        // there, its shadow stack overflowed). rustc aborts the process there, and a module must
+        // not end its host: the module's call ends instead. The walk is cut at the module's
+        // edge: its frames' remaining cleanups are skipped, as the abort skips them, and the
+        // host's frames unwind as for any panic of the module's.
+        CLEANING.with(|c| c.set(0));
+        CUT.with(|c| c.set(true));
+        UNWINDING.with(|c| c.set(true));
+        raise_with(kind, format!("{message} (in a sandboxed module's cleanup: its remaining cleanups were skipped)"), site, 0, rbp, ret, regs)
+    }
     if ctx != 0 && CLEANING.with(|c| c.get()) == ctx {
         let frames = collect_frames(rbp, ret, true);
         let location = PANIC_LOC.with(|l| std::mem::take(&mut *l.borrow_mut()));
@@ -3694,6 +3721,10 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
     // the sp of the frame (fp, ret) names, at its call
     let mut sp = regs as u64 + BLOCK_CALLER_SP;
     let mut native = None;
+    // a walk cut at a module's edge (raise_unwinding): twins' frames are walked past up to the
+    // first frame of host code
+    let mut cut = CUT.with(|c| c.replace(false));
+    let mut twin_landing = false;
     for _ in 0..100_000 {
         let (fp, ret) = (r[0], r[1]);
         // the threaded interpreter's call boundary: a frame with a landing that hands the unwind
@@ -3730,9 +3761,16 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
             },
         };
         let off = (ret - start) as u32;
-        if let Some(&(_, stub)) = info.pads.iter().find(|p| p.0 == off) {
-            target = Some((fp, fp - info.sp_off as u64, start + stub as u64));
-            break;
+        let twin = tables.is_twin(start);
+        cut &= twin;
+        // a twin's landing is walked past when the walk is cut, or when the module's call has
+        // spent its fuel: the cleanup's first block would stop it again, a panic in its cleanup
+        if !(twin && (cut || crate::sandbox::fuel_spent())) {
+            if let Some(&(_, stub)) = info.pads.iter().find(|p| p.0 == off) {
+                target = Some((fp, fp - info.sp_off as u64, start + stub as u64));
+                twin_landing = twin;
+                break;
+            }
         }
         // this frame has no cleanup here: the caller's callee-saved registers come back from
         // where the prologue saved them, then the caller's frame
@@ -3762,6 +3800,7 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
     match target {
         Some((fp, sp, pc)) => {
             CLEANING.with(|c| c.set(*ctx_ptr()));
+            CLEANING_TWIN.with(|c| c.set(twin_landing));
             // the block outlives this frame: land() reads it after sp moved up past it, so it
             // goes in a thread-local
             LAND_REGS.with(|b| {
@@ -3904,6 +3943,7 @@ pub(crate) fn take_panic_message() -> Option<String> {
 
 pub(crate) fn abandon_unwind() {
     CLEANING.with(|c| c.set(0));
+    CUT.with(|c| c.set(false));
     UNWINDING.with(|c| c.set(false));
     PANIC.with(|p| *p.borrow_mut() = None);
 }
@@ -5489,7 +5529,8 @@ impl Unit {
     /// unit code: inserted in order).
     pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<relax_backend::rir::UnwindInfo>) {
         let kind = code_as_now().unwrap_or_else(|| self.default_code_kind(id));
-        self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, kind);
+        let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
+        self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind, kind, twin);
         crate::inspect::flightrec::jit_install(id, len, kind.tier, kind.origin);
         if crate::inspect::pstream::viewing() {
             let src = crate::inspect::codever::fn_lines(self, id).and_then(|(f, lo, _)| self.prog.file_paths.get(f as usize).map(|p| format!("{}:{}", p, lo))).unwrap_or_default();
@@ -8661,13 +8702,14 @@ impl Unit {
     #[track_caller]
     pub(crate) fn install_prelinked(&mut self, id: u32, at: u64, len: u32, trailer: &'static [u8], pc_map: PcMap, refs: CodeRefs) {
         unsafe { realtime_installed(self, id, &refs, std::panic::Location::caller()) };
+        let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
         {
             let mut t = self.code.write().unwrap_or_else(|e| e.into_inner());
             if !trailer.is_empty() {
                 t.add_image_unwind(at, trailer, &pc_map);
             }
             let kind = code_as_now().unwrap_or(CodeKind::new(tier::O1, origin::IMAGE));
-            t.add(at, len, id, None, kind);
+            t.add(at, len, id, None, kind, twin);
             t.note_refs(at, refs);
         }
         let f = &mut self.fns[id as usize];

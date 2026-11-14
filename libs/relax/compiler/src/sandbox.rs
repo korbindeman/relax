@@ -19,7 +19,10 @@
 //!   target into the sandbox thunk table; host runtime and C calls are allow-listed and the
 //!   memory ones replaced by arena-checked versions (malloc & co. allocate in the arena);
 //! - in a domain that meters fuel (`Domain::fuel`), pre-optimization RIR blocks spend
-//!   deterministic instruction fuel at entry.
+//!   deterministic instruction fuel at entry;
+//! - a module's cleanups never end its host: a call that has spent its fuel runs none of them
+//!   (each would stop again), and a panic raised in one (rustc aborts the process there) cuts
+//!   the unwind at the module's edge, its remaining cleanups skipped (jit.rs unwind_walk).
 //!
 //! Host code reaches a module only through generated wrapper functions (modules.rs) that enter
 //! the module's arena, copy reference arguments into it, call the twin and leave. Plain-data
@@ -988,6 +991,12 @@ fn words() -> *mut i64 {
 
 fn sb_ready() -> bool {
     TLS_OFF.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// This thread's call into a module has spent its fuel: no block of the module's code can run,
+/// its cleanups' neither (each one's meter would stop it again).
+pub(crate) fn fuel_spent() -> bool {
+    sb_ready() && unsafe { *words() != 0 && *words().add((W_FUEL / 8) as usize) < 0 }
 }
 
 fn cur_arena() -> Option<&'static Arena> {

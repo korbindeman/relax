@@ -105,6 +105,11 @@ if [ "$GOT" = $'out calls returned: 100\nout most inside at once: 64' ]; then ec
 OUT=$(RELAX_MODULE_FUEL=1000000 "$1" test "$D/fuel.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-fuel.out")" ]; then echo "modules fuel: PASS"; else echo "modules fuel: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -6; FAILS=$((FAILS + 1)); fi
+# A module's cleanups never end the host: a fuel stop with values to drop, a destructor that runs
+# out of fuel or panics while the module unwinds (rustc aborts there) end the call at the guard.
+OUT=$(RELAX_MODULE_FUEL=1000000 "$1" test "$D/fuel_cleanup.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-fuel-cleanup.out")" ]; then echo "modules fuel cleanup: PASS"; else echo "modules fuel cleanup: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
 bash "$D/milk.sh" "$1" || FAILS=$((FAILS + 1))
 OUT=$(RELAX_SANDBOX_FUEL=0 "$1" test "$D/deadline.rs" 2>&1)
 STATUS=$?
