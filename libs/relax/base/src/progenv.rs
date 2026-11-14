@@ -838,9 +838,13 @@ pub fn build_wire() -> Vec<u8> {
 /// The program's environment as this process was started, when its host builds with a handed one.
 static PROGRAM_START: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
 
-/// `env` without what one process hands the next (`HANDOVER`) and without the run facts.
+/// `env` without what one process hands the next (`HANDOVER`), without the run facts and without
+/// the grants' names (options.rs GRANTS): a `makepad run` host takes a grant from its words alone,
+/// so the environment a run builds with, its own or one it was handed, carries none to a run it
+/// hands it to.
 fn build_part(env: &[(Vec<u8>, Vec<u8>)]) -> Env {
-    env.iter().filter(|(k, _)| !run_fact(k) && !HANDOVER.iter().any(|h| same_name(h, k))).cloned().collect()
+    let grant = |k: &[u8]| crate::options::GRANTS.iter().any(|(_, name)| same_name(name.as_bytes(), k));
+    env.iter().filter(|(k, _)| !run_fact(k) && !grant(k) && !HANDOVER.iter().any(|h| same_name(h, k))).cloned().collect()
 }
 
 /// A child run handed a build environment (`BUILD_ENV`): `start` is its environment as started,
@@ -952,7 +956,8 @@ mod tests {
         let start: Env = vec![(b("RELAX_ARG0"), b("/run/bin/app")), (b("RELAX_CACHE_DIR"), b("/given")), (b("RELAX_BUILD_ENV"), b("..."))];
         // (a hand-off that names a grant or a handover: none of them is taken)
         let build: Env = vec![(b("HOME"), b("/h")), (b("PATH"), b("/tools")), (b("RELAX_CACHE_DIR"), b("/test")), (b("RELAX_STD"), b("/std")),
-            (b("RELAX_ALLOW_C"), b("1")), (b("RELAX_RUN_NATIVE"), b("/forged.json")), (b("RELAX_ARG0"), b("/forged")), (b("RELAX_BUILD_ENV"), b("x"))];
+            (b("RELAX_ALLOW_C"), b("1")), (b("RELAX_MODULES_TRUSTED"), b("1")), (b("RELAX_MODULE_FUEL"), b("9")), (b("RELAX_RUN_NATIVE"), b("/forged.json")),
+            (b("RELAX_ARG0"), b("/forged")), (b("RELAX_BUILD_ENV"), b("x"))];
         let (host, hidden, program) = take_build(&start, &build);
         let mut host_names: Vec<String> = host.iter().map(|(k, v)| format!("{}={}", String::from_utf8_lossy(k), String::from_utf8_lossy(v))).collect();
         host_names.sort();
