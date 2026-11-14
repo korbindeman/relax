@@ -5,6 +5,8 @@
 //! them: none is left a call for want of a front made already. And O3 code a warm launch links
 //! from the disk cache that kept a callee as a call (incomplete: built before the callee could be
 //! inlined) is built again once it can be, as the build that stored it would have been.
+//! And a slot waiting for its O2 build leaves its O1 code in the disk cache: a run that ends
+//! before that build gives the next launch an entry to link.
 
 use super::*;
 
@@ -391,6 +393,100 @@ fn linked_incomplete_o3_is_built_again() {
         assert_eq!(tier, "O3");
         assert!(inlined, "the quicksort's build again inlines the closure: {n}");
         assert_eq!(run(), result, "O3 code must compute what the linked code did");
+    }
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+}
+
+const HINTED_SOURCE: &str = r#"
+pub fn fit(x: u32) -> u32 {
+    let len = |y: u32| y.wrapping_mul(3) ^ 5;
+    len(x)
+}
+fn main() {}
+"#;
+
+/// A closure follows its fn's level, and a fn whose baseline code keeps running is hinted O2
+/// (o2_base): the closure's first code is O1 and its O2 build is queued. That O1 code was left
+/// out of the disk cache (the O2 build was to be the entry), and the O2 worker, the lowest
+/// priority, rarely got to it before the run ended: the closure had no entry, and every warm
+/// launch missed and built it again, recording nothing (a text layouter's closure, each warm run
+/// of a widget bench). Each phase is one launch over the same cache; no worker runs, so the O2
+/// build never comes.
+#[test]
+fn a_closure_of_a_hinted_fn_is_linked_by_the_next_launch() {
+    const PHASE: &str = "RELAX_HINTED_CLOSURE_TEST";
+    const DIR: &str = "RELAX_HINTED_CLOSURE_TEST_DIR";
+    let Ok(phase) = std::env::var(PHASE) else {
+        let dir = std::env::temp_dir().join(format!("relax-hinted-closure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("input.rs"), HINTED_SOURCE).unwrap();
+        let mut said = String::new();
+        for phase in ["cold", "warm"] {
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "jit::tier_stuck_tests::a_closure_of_a_hinted_fn_is_linked_by_the_next_launch", "--nocapture", "--test-threads=1"])
+                .env(PHASE, phase).env(DIR, &dir).env("RELAX_SPEC", "0"));
+            said += &format!("{phase}: {}\n{}\n", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "{said}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    };
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    }
+    crate::borrowck::lazy::disable_gandalf();
+    let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), dir.join("input.rs").to_str().unwrap(), "hinted_closure", false).unwrap();
+    let fit_d = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && d.kind == DefKind::Fn && prog.name(id) == "fit").then_some(id)
+    }).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    // (the queued O2 build stays queued: the run ends before it, as a short one does)
+    queue::stop_workers(std::time::Duration::from_secs(10));
+    // fit's lowering makes the closure's slot
+    let (fit, closure) = crate::owner::call(crate::owner::Class::Program, || {
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        let fit = u.fn_id(FnKey::Inst(fit_d, Vec::new()));
+        unsafe { compile_fn(up, fit) }.unwrap();
+        (fit, (0..u.fns.len() as u32).find(|&id| matches!(u.fns[id as usize].key, FnKey::Closure(_, _, p) if p == fit)))
+    });
+    let closure = closure.expect("fit's closure has a slot");
+    if phase == "cold" {
+        let (marked, recorded) = crate::owner::call(crate::owner::Class::Program, || {
+            // fit's baseline code keeps running: its O2 build is queued, and it is hinted O2
+            assert!(unsafe { o2_base(up, fit) });
+            let marked = marked_hot(&u, closure);
+            let before = u.cache.as_ref().unwrap().stats.recorded;
+            // the closure's first call
+            let _ = unsafe { compile_slot_locked(up, closure, false) };
+            u.flush_cache_records();
+            let recorded = u.cache.as_ref().unwrap().stats.recorded - before;
+            let mut cache = u.cache.take().unwrap();
+            if let Some(spill) = cache.spill_take() {
+                assert!(spill.write().unwrap() > 0);
+            }
+            u.cache = Some(cache);
+            (marked, recorded)
+        });
+        assert!(marked, "the fixture: the closure follows fit's O2 hint");
+        assert_eq!(recorded, 1, "the closure's O1 code is its entry while its O2 build waits");
+    } else {
+        let (linked, misses, built) = crate::owner::call(crate::owner::Class::Program, || {
+            let (misses, built) = (u.cache.as_ref().unwrap().stats.misses, u.stats.compiled);
+            let linked = unsafe { ready_code_locked(up, closure) }.is_some();
+            (linked, u.cache.as_ref().unwrap().stats.misses - misses, u.stats.compiled - built)
+        });
+        assert_eq!((linked, misses, built), (true, 0, 0), "the next launch links the closure: (linked, misses, builds) on it");
     }
     // (process exit owns the runtime's teardown)
     std::mem::forget(u);

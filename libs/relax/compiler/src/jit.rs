@@ -10041,9 +10041,12 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
     // built while an earlier request's slot was open (it was left out): no cache record
     if record && TAINTED.with(|t| t.get()) { crate::cache::trace_lookup(&*up, id, "norecord:tainted"); }
     let record = record && !TAINTED.with(|t| t.get());
-    // a `#[relax(O2)]` fn's O1 code is not the cache's entry for it: the O2 worker's code is
-    let o2 = record && marked_hot(&*up, id);
-    let record = record && !o2;
+    // a slot marked O2 (`#[relax(O2)]`, a closure of a hinted fn, a slot found hot) gets its O2
+    // build from the O2 worker, whose code replaces its entry (record_o2). Its O1 code is still
+    // recorded: that worker runs at the lowest priority and a run can end before it gets there,
+    // and a slot with no entry was built again by every warm launch (a layouter closure missed
+    // in each warm run, 11-14)
+    let marked = marked_hot(&*up, id);
     // baseline code (built this run, or a TIER_BASE entry linked from the cache): it may keep
     // running (note_base)
     let base = if record {
@@ -10099,6 +10102,11 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                 }
             }
             let linked_from_cache = !record && !u.fns[id as usize].compiled && !u.fns[id as usize].o3.load(Ordering::Relaxed);
+            // fresh code of a marked slot gets its O2 build, and so does O1 code linked for one (an
+            // earlier run ended before that build); linked baseline code gets it by running
+            // (base_running), and an O2 entry's slot is queued already (o2_cached)
+            let o2 = marked && (record || linked_from_cache && !base);
+            if o2 && record { crate::cache::trace_lookup(u, id, "o2-marked"); }
             // makepad inspect: what this code is (O3-always's first code says so itself)
             let kind = if fresh {
                 CodeKind::new(if base { tier::BASELINE } else { tier::O1 }, origin::FRESH)
@@ -12371,7 +12379,8 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done, cut: bool) {
     }
 }
 
-/// Marked `#[relax(O2)]` or higher: compiled at O2 from its first build, never O1.
+/// Marked `#[relax(O2)]` or higher, or hinted (relax_level): the O2 worker builds it at O2; a
+/// program thread's build before that is O1 (its entry until the O2 code replaces it).
 fn marked_hot(u: &Unit, id: u32) -> bool {
     relax_level(u, id) >= 2
 }
@@ -26209,9 +26218,8 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
             crate::boot_stats::fn_installed(boot_arm(u, id));
             if spec {
                 // a speculative build is valid code whether or not it gets called: cache it now
-                // (not an O2 fn's O1 code: the O2 worker records its entry)
-                if marked_hot(u, id) {
-                } else if let Some(mut c) = u.cache.take() {
+                // (a marked slot's too: its O2 build replaces the entry, install_compiled)
+                if let Some(mut c) = u.cache.take() {
                     c.record(u, id, &code, &relocs, &map);
                     u.cache = Some(c);
                 }
