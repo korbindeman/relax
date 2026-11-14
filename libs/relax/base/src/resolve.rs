@@ -1465,8 +1465,11 @@ pub fn cargo_config_files(dir: &str) -> Vec<(String, String)> {
 /// field, and a string in one file against a table in another is an error. A `relative` value is
 /// joined to the folder of the file its `value` comes from (Path::join: unnormalized, an absolute
 /// value stands). An entry applies when it is `force`d or the process environment lacks the
-/// variable. CARGO_HOME, RUSTUP_HOME and RUSTUP_TOOLCHAIN may not be set there.
-pub fn cargo_env(dir: &str) -> Result<Vec<(String, String)>, String> {
+/// variable. CARGO_HOME, RUSTUP_HOME and RUSTUP_TOOLCHAIN may not be set there. Nor are Relax's
+/// own names (`RELAX_*`, progenv `reserved`): a repository's configuration does not set what a
+/// Relax host or a build script's host reads, such as its trust settings; each is left out and
+/// named in the second list (`<file>: [env] `<name>``), for the run to say so.
+pub fn cargo_env(dir: &str) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     // a plain string, or the table's (value and its file's folder, force, relative)
     enum Entry { Plain(String), Options(Option<(String, String)>, Option<bool>, Option<bool>) }
     let mut env: BTreeMap<String, (Entry, String)> = BTreeMap::new();
@@ -1505,10 +1508,14 @@ pub fn cargo_env(dir: &str) -> Result<Vec<(String, String)>, String> {
             }
         }
     }
-    let mut out = Vec::new();
+    let (mut out, mut ignored) = (Vec::new(), Vec::new());
     for (k, (e, path)) in env {
         if ["CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"].contains(&k.as_str()) {
             return Err(format!("{}: setting the `{}` environment variable is not supported in the `[env]` configuration table", path, k));
+        }
+        if crate::progenv::reserved(k.as_bytes()) {
+            ignored.push(format!("{}: [env] `{}`", path, k));
+            continue;
         }
         let (value, force) = match e {
             Entry::Plain(value) => (value, false),
@@ -1520,7 +1527,7 @@ pub fn cargo_env(dir: &str) -> Result<Vec<(String, String)>, String> {
         };
         if force || std::env::var_os(&k).is_none() { out.push((k, value)); }
     }
-    Ok(out)
+    Ok((out, ignored))
 }
 
 /// What a cargo profile sets that changes what a program's code does: `debug-assertions`

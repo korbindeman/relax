@@ -20,6 +20,9 @@
 //!   it, and a self-exec child's host does not either. A provided crate's rustc code reads the
 //!   program's environment through relax-api's `env` (`program_var_os`), for a setting that only
 //!   tunes or reports the program's own run; its `std::env` stays the host's (KNOWN_GAPS 7).
+//! - A reserved name of cargo's run-time environment of the target (a build script's `rustc-env`,
+//!   `set_program_value`) is a program value too. Cargo's `[env]` sets no reserved name
+//!   (resolve.rs `cargo_env`): a repository does not set what a Relax host reads.
 //!
 //! The policy is the pure function `child_env`: what each child gets. A self-exec child (this
 //! program again, `makepad run ... --`) gets every reserved name from this process's environment
@@ -416,6 +419,17 @@ pub fn set_run_env(values: &[(String, String)]) -> Vec<(String, String)> {
         applied.push((k.clone(), v.clone()));
     }
     applied
+}
+
+/// A reserved name of cargo's run-time environment of the target (relax-front `set_program_env`:
+/// a path package's build-script `rustc-env`): the program's value, in its overlay, never this
+/// process's environment. The program and its children read it as under cargo; this host's
+/// options and a self-exec child's host never do, so a build script does not switch off the
+/// run's confinement (RELAX_SANDBOX_FUEL, RELAX_SANDBOX_NOCHECK). The overlay keeps it over a
+/// restart in place, as it keeps `set_run_env`'s; the next run writes its own.
+pub fn set_program_value(name: &str, value: &str) {
+    assert!(reserved(name.as_bytes()), "{name} is no reserved name");
+    write(name.as_bytes(), Some(value.as_bytes()));
 }
 
 /// What `set_run_env` gave the program, as the line the run prints when its session starts (the

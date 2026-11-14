@@ -653,13 +653,20 @@ static PROGRAM_PROCESS: Mutex<ProgramProcess> = Mutex::new(ProgramProcess { env:
 /// Sets the variables of `env` in this process for the program the run calls next (the first
 /// value of a name stands), and makes `dir` the working folder when given. Each one's previous
 /// state is kept: crate_env_named reads it, and the run's end puts it back (reset_statics), so a
-/// restart starts as this run did. Call it with no program thread running.
+/// restart starts as this run did. A reserved name (`RELAX_*`, a path package's build-script
+/// `rustc-env`) is the program's alone (progenv `set_program_value`): never in this process's
+/// environment, which this host and a self-exec child's host read their options from. Call it
+/// with no program thread running.
 pub fn set_program_env(env: &[(String, String)], dir: Option<&str>) {
     // the record lives for the run: grown in the kept phase
     let _k = crate::zone_alloc::kept();
     let mut p = PROGRAM_PROCESS.lock().unwrap();
     for (i, (k, v)) in env.iter().enumerate() {
         if env[..i].iter().any(|(n, _)| n == k) { continue; }
+        if crate::progenv::reserved(k.as_bytes()) {
+            crate::progenv::set_program_value(k, v);
+            continue;
+        }
         if !p.env.iter().any(|(n, _)| n == k) { p.env.push((k.clone(), std::env::var_os(k))); }
         unsafe { std::env::set_var(k, v) };
     }

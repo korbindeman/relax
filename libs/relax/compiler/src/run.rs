@@ -692,7 +692,11 @@ pub(crate) fn resolve_package(
     // cargo's `[env]` configuration of the workspace, for every crate's compile-time environment
     // and every build script (a build script's own run has it in its process environment)
     if std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() {
-        crate::crates::set_config_env(crate::resolve::cargo_env(workspace)?);
+        let (env, ignored) = crate::resolve::cargo_env(workspace)?;
+        for entry in ignored {
+            eprintln!("{}: {entry} is ignored: RELAX_* names are Relax's own settings, never a cargo configuration's", crate::tool_name());
+        }
+        crate::crates::set_config_env(env);
     }
     let t_loaded = Instant::now();
     // The graph is enough to choose the host. Its window opens now, beside the rest of the
