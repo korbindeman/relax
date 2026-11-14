@@ -9,5 +9,7 @@ build = "build.rs"
 [features]
 # the program also calls C that calls a symbol nothing defines
 needed = []
+# the static library holds the program's member twice (a merged archive)
+twice = []
 
 [workspace]

@@ -726,8 +726,9 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
     let mut statics: Vec<String> = Vec::new();
     // each static library with the search paths of the script that named it: the copy that script
     // built (a bundled sqlite in its OUT_DIR) wins over one of the same name in a path another
-    // script added (on Linux, the system's non-PIC libsqlite3.a in the path fontconfig's script adds)
-    let mut static_homes: Vec<(String, Vec<String>)> = Vec::new();
+    // script added (on Linux, the system's non-PIC libsqlite3.a in the path fontconfig's script
+    // adds); and the script's package (its `pkg` index: the archives' order on macOS)
+    let mut static_homes: Vec<(String, Vec<String>, usize)> = Vec::new();
     let mut archives: Vec<String> = Vec::new();
     let mut search: Vec<String> = Vec::new();
     let mut fw_search: Vec<String> = Vec::new();
@@ -787,7 +788,7 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
             };
             match kind.as_str() {
                 "static" => {
-                    static_homes.push((name.clone(), own_search.clone()));
+                    static_homes.push((name.clone(), own_search.clone(), scripts_of[s].0));
                     statics.push(name);
                 }
                 "framework" => {
@@ -802,8 +803,18 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
         }
         scripts.push(ScriptOut { ..out });
     }
+    // The messages come in the order cargo's scripts finished, which changes from build to build.
+    // The Mach-O link takes a symbol two archives define from the first of them (link: normal
+    // extraction), so there the archives go in the packages' order (name, version, folder), each
+    // script's own libraries in the order it named them: the same for every build.
+    if archives_by_package() {
+        static_homes.sort_by(|a, b| {
+            let (p, q) = (&pkg[a.2], &pkg[b.2]);
+            (&p.1, &p.2, &p.0).cmp(&(&q.1, &q.2, &q.0))
+        });
+    }
     // the out dirs of the scripts hold archives too (cc's output is `native=<out_dir>`)
-    for (name, own_search) in &static_homes {
+    for (name, own_search, _) in &static_homes {
         let file = format!("lib{}.a", name);
         match own_search.iter().chain(search.iter()).map(|d| format!("{}/{}", d, file)).find(|p| std::path::Path::new(p).is_file()) {
             Some(p) => {
@@ -815,6 +826,12 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
         }
     }
     Ok(Outputs { scripts, runs, env: env_seen, statics, archives, search, fw_search, dylibs, frameworks, link_args })
+}
+
+/// Whether the native library's archives go in their packages' order (outputs_with): the Mach-O
+/// link, which extracts members by symbol across all its archives.
+fn archives_by_package() -> bool {
+    cfg!(target_os = "macos")
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1307,19 +1324,32 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
     let addresses_path = format!("{}.addresses.o", tmp);
     let mut cmd = Command::new(cc());
     // every member of the archives, for the loader's check of which callbacks the program needs
-    // (native_stub member_table): the link takes them all, the program's imports are known when it loads
+    // (native_stub member_table): each global symbol they define is a root, so the link takes every
+    // member that defines one; the program's imports are known when it loads
     let members;
     if cfg!(target_os = "macos") {
         cmd.args(["-dynamiclib", "-o", &tmp, "-Wl,-undefined,dynamic_lookup"]);
-        for a in archives {
-            cmd.arg(format!("-Wl,-force_load,{}", a));
-        }
-        // C built with -fvisibility=hidden and assembly's `.private_extern` (ring's core) stay
-        // local to the library, where dlsym cannot see them: the same address accessors as Linux
         let symbols;
         (symbols, members) = macho_archive_symbols(archives)?;
-        compile_accessors(&symbols, &tmp, &addresses_path)?;
+        // Each member is taken by normal archive extraction, as on Linux: every defined global
+        // symbol is a root (`-u`), and the first member in the archives' order that defines it
+        // provides it. -force_load took every member, so an archive holding an object twice (a
+        // merged archive) failed on duplicate definitions. The roots go to the C driver in a
+        // response file (a large library defines tens of thousands); `-Xlinker` keeps a name
+        // whole whatever it holds.
+        let roots = symbols.keys().map(|name| {
+            format!("-Xlinker -u -Xlinker \"{}\"\n", name.replace('\\', "\\\\").replace('"', "\\\""))
+        }).collect::<String>();
+        std::fs::write(&symbols_path, roots).map_err(|e| format!("{symbols_path}: {e}"))?;
+        cmd.arg(format!("@{symbols_path}"));
+        // C built with -fvisibility=hidden and assembly's `.private_extern` (ring's core) stay
+        // local to the library, where dlsym cannot see them: the same address accessors as Linux
+        if let Err(e) = compile_accessors(&symbols, &tmp, &addresses_path) {
+            let _ = std::fs::remove_file(&symbols_path);
+            return Err(e);
+        }
         cmd.arg(&addresses_path);
+        cmd.args(archives);
     } else {
         if cfg!(windows) {
             // a DLL (mingw-w64's gcc and ld) that exports every global symbol of what it links,
@@ -1739,6 +1769,39 @@ fn a_static_library_comes_from_the_script_that_built_it() {
     let out = outputs_with(&pkg, &scripts, &[0, 1], &messages).unwrap_or_else(|e| panic!("{e}"));
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(out.archives, vec![format!("{}/libsqlite3.a", bundled.display())]);
+}
+
+#[cfg(test)]
+#[test]
+fn same_named_archives_stay_their_scripts_own_and_keep_one_order() {
+    // two grammar packages whose scripts each build a `parser` into their own OUT_DIR (the first a
+    // `scanner` too), their messages in either order: cargo prints them as the scripts finish
+    let root = std::env::temp_dir().join(format!("relax-native-archive-order-{}", std::process::id()));
+    let (a, b) = (root.join("a-out"), root.join("b-out"));
+    for (d, libs) in [(&a, &["parser", "scanner"][..]), (&b, &["parser"][..])] {
+        std::fs::create_dir_all(d).unwrap();
+        for l in libs {
+            std::fs::write(d.join(format!("lib{l}.a")), b"!<arch>\n").unwrap();
+        }
+    }
+    let pkg = vec![
+        (String::new(), "grammar-b-sys".to_string(), "1.0.0".to_string()),
+        (String::new(), "grammar-a-sys".to_string(), "1.0.0".to_string()),
+    ];
+    let scripts = vec![(0usize, Vec::new()), (1usize, Vec::new())];
+    let line = |name: &str, dir: &std::path::Path, libs: &str| format!(
+        r#"{{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#{name}@1.0.0","linked_libs":[{libs}],"linked_paths":["native={}"],"cfgs":[],"env":[],"out_dir":""}}"#, dir.display());
+    let (la, lb) = (line("grammar-a-sys", &a, r#""static=parser","static=scanner""#), line("grammar-b-sys", &b, r#""static=parser""#));
+    let a_first = outputs_with(&pkg, &scripts, &[0, 1], &format!("{la}\n{lb}\n")).unwrap_or_else(|e| panic!("{e}"));
+    let b_first = outputs_with(&pkg, &scripts, &[0, 1], &format!("{lb}\n{la}\n")).unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_dir_all(&root);
+    let want = vec![format!("{}/libparser.a", a.display()), format!("{}/libscanner.a", a.display()), format!("{}/libparser.a", b.display())];
+    let sorted = |v: &[String]| { let mut v = v.to_vec(); v.sort(); v };
+    assert_eq!(sorted(&a_first.archives), sorted(&want), "each script's `parser` is the one in its own folder, both linked");
+    assert_eq!(sorted(&b_first.archives), sorted(&want), "each script's `parser` is the one in its own folder, both linked");
+    if archives_by_package() {
+        assert_eq!((a_first.archives, b_first.archives), (want.clone(), want), "the packages' order, whichever script finished first");
+    }
 }
 
 #[cfg(test)]
