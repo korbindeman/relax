@@ -727,7 +727,7 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
     // each static library with the search paths of the script that named it: the copy that script
     // built (a bundled sqlite in its OUT_DIR) wins over one of the same name in a path another
     // script added (on Linux, the system's non-PIC libsqlite3.a in the path fontconfig's script
-    // adds); and the script's package (its `pkg` index: the archives' order on macOS)
+    // adds); and the script's package (its `pkg` index: the archives' order)
     let mut static_homes: Vec<(String, Vec<String>, usize)> = Vec::new();
     let mut archives: Vec<String> = Vec::new();
     let mut search: Vec<String> = Vec::new();
@@ -804,15 +804,14 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
         scripts.push(ScriptOut { ..out });
     }
     // The messages come in the order cargo's scripts finished, which changes from build to build.
-    // The Mach-O link takes a symbol two archives define from the first of them (link: normal
-    // extraction), so there the archives go in the packages' order (name, version, folder), each
-    // script's own libraries in the order it named them: the same for every build.
-    if archives_by_package() {
-        static_homes.sort_by(|a, b| {
-            let (p, q) = (&pkg[a.2], &pkg[b.2]);
-            (&p.1, &p.2, &p.0).cmp(&(&q.1, &q.2, &q.0))
-        });
-    }
+    // The link takes a symbol two archives define from the first of them (link: every defined
+    // global is a root, and ld64 and GNU ld alike take it from the first archive that has it), so
+    // the archives go in the packages' order (name, version, folder), each script's own libraries
+    // in the order it named them: the same for every build.
+    static_homes.sort_by(|a, b| {
+        let (p, q) = (&pkg[a.2], &pkg[b.2]);
+        (&p.1, &p.2, &p.0).cmp(&(&q.1, &q.2, &q.0))
+    });
     // the out dirs of the scripts hold archives too (cc's output is `native=<out_dir>`)
     for (name, own_search, _) in &static_homes {
         let file = format!("lib{}.a", name);
@@ -826,12 +825,6 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
         }
     }
     Ok(Outputs { scripts, runs, env: env_seen, statics, archives, search, fw_search, dylibs, frameworks, link_args })
-}
-
-/// Whether the native library's archives go in their packages' order (outputs_with): the Mach-O
-/// link, which extracts members by symbol across all its archives.
-fn archives_by_package() -> bool {
-    cfg!(target_os = "macos")
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1799,9 +1792,7 @@ fn same_named_archives_stay_their_scripts_own_and_keep_one_order() {
     let sorted = |v: &[String]| { let mut v = v.to_vec(); v.sort(); v };
     assert_eq!(sorted(&a_first.archives), sorted(&want), "each script's `parser` is the one in its own folder, both linked");
     assert_eq!(sorted(&b_first.archives), sorted(&want), "each script's `parser` is the one in its own folder, both linked");
-    if archives_by_package() {
-        assert_eq!((a_first.archives, b_first.archives), (want.clone(), want), "the packages' order, whichever script finished first");
-    }
+    assert_eq!((a_first.archives, b_first.archives), (want.clone(), want), "the packages' order, whichever script finished first");
 }
 
 #[cfg(test)]
