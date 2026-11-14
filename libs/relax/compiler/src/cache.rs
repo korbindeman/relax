@@ -5056,6 +5056,33 @@ struct CheckoutText {
     forms: Vec<Vec<u8>>,
     /// the first bytes of `forms`, a bit each
     first: [u64; 4],
+    /// the spellings of the shared roots (Anchors::shared_roots, spelled as `forms`): a spelling
+    /// of the checkout found wholly inside one of them is part of that root's path, not the
+    /// checkout's (a non-ASCII root has none: what it holds counts)
+    roots: Vec<Vec<u8>>,
+}
+
+/// A folder's spellings as a data object could hold it: as written and with its links resolved,
+/// with either separator and in the `\\?\` form, ASCII-lowercased, in UTF-8 and UTF-16. None:
+/// a folder with non-ASCII characters (its NFC and NFD spellings differ byte by byte).
+fn dir_spellings(dir: &str) -> Option<Vec<Vec<u8>>> {
+    let canon = resolved_spelling(dir);
+    if !dir.is_ascii() || !canon.is_ascii() {
+        return None;
+    }
+    let mut texts = vec![dir.to_string(), canon];
+    for t in texts.clone() {
+        texts.push(t.replace('/', "\\"));
+        texts.push(t.replace('\\', "/"));
+        texts.push(format!("\\\\?\\{}", t.replace('/', "\\")));
+    }
+    let mut forms = Vec::new();
+    for t in texts {
+        let t = t.to_ascii_lowercase();
+        forms.push(t.encode_utf16().flat_map(u16::to_le_bytes).collect());
+        forms.push(t.into_bytes());
+    }
+    Some(forms)
 }
 
 impl CheckoutText {
@@ -5064,21 +5091,7 @@ impl CheckoutText {
     fn of(anchors: &crate::dirs::Anchors) -> Option<CheckoutText> {
         let mut forms: Vec<Vec<u8>> = vec![b"\0ws\0".to_vec(), b"\0run\0".to_vec()];
         for dir in anchors.checkout_dirs().filter(|d| !d.is_empty()) {
-            let canon = resolved_spelling(dir);
-            if !dir.is_ascii() || !canon.is_ascii() {
-                return None;
-            }
-            let mut texts = vec![dir.to_string(), canon];
-            for t in texts.clone() {
-                texts.push(t.replace('/', "\\"));
-                texts.push(t.replace('\\', "/"));
-                texts.push(format!("\\\\?\\{}", t.replace('/', "\\")));
-            }
-            for t in texts {
-                let t = t.to_ascii_lowercase();
-                forms.push(t.encode_utf16().flat_map(u16::to_le_bytes).collect());
-                forms.push(t.into_bytes());
-            }
+            forms.extend(dir_spellings(dir)?);
         }
         forms.sort();
         forms.dedup();
@@ -5086,17 +5099,25 @@ impl CheckoutText {
         for f in &forms {
             first[(f[0] >> 6) as usize] |= 1 << (f[0] & 63);
         }
-        Some(CheckoutText { forms, first })
+        let mut roots: Vec<Vec<u8>> = anchors.shared_roots().iter().filter_map(|r| dir_spellings(r)).flatten().collect();
+        roots.sort();
+        roots.dedup();
+        Some(CheckoutText { forms, first, roots })
     }
 
-    /// Whether `bytes` holds one of the spellings: one pass, a spelling compared only where a
-    /// byte starts one (it runs over each data object sealed code names, once a run).
+    /// Whether `bytes` holds one of the spellings, other than wholly inside a shared root's: one
+    /// pass, a spelling compared only where a byte starts one (it runs over each data object
+    /// sealed code names, once a run). A spelling that continues past the root's (a value made
+    /// from the checkout's folder and more text) still counts.
     fn found_in(&self, bytes: &[u8]) -> bool {
+        let at = |j: usize, f: &[u8]| bytes[j..].get(..f.len()).is_some_and(|w| w.eq_ignore_ascii_case(f));
         (0..bytes.len()).any(|i| {
             let b = bytes[i].to_ascii_lowercase();
             self.first[(b >> 6) as usize] >> (b & 63) & 1 == 1
-                && self.forms[self.forms.partition_point(|f| f[0] < b)..].iter().take_while(|f| f[0] == b)
-                    .any(|f| bytes[i..].get(..f.len()).is_some_and(|w| w.eq_ignore_ascii_case(f)))
+                && self.forms[self.forms.partition_point(|f| f[0] < b)..].iter().take_while(|f| f[0] == b).any(|f| {
+                    let end = i + f.len();
+                    at(i, f) && !self.roots.iter().any(|r| r.len() >= f.len() && (end.saturating_sub(r.len())..=i).any(|j| at(j, r)))
+                })
         })
     }
 }
@@ -9199,7 +9220,8 @@ mod data_tests {
     /// when the cargo home lies in the checkout. With no shared store nothing is shared: b's first
     /// run hits none of a's code, each sees its own edit, and a's reopen records nothing. Code made
     /// from sealed crates alone whose constant holds the checkout's path (dep::twice here) is never
-    /// recorded: its key names no checkout. Over a shared store (OpenFrom::shared, the same order
+    /// recorded: its key names no checkout, while a path in std's folder or the registry is the
+    /// root's even where the checkout's folder name begins it. Over a shared store (OpenFrom::shared, the same order
     /// again on fresh run dirs) b's first run links the code a made from sealed crates alone and
     /// records none of it; code naming a type of the checkout stays in the checkout's store; later
     /// runs record nothing; a std elsewhere reads none of the shared code; and `a` moved (its run
@@ -9311,6 +9333,21 @@ mod data_tests {
         assert!(text.found_in(&wide), "a's folder in UTF-16");
         assert!(!text.found_in(b.to_str().unwrap().as_bytes()) && !text.found_in(cargo.to_str().unwrap().as_bytes()), "b's folder and the cargo home are not a's");
         assert!(CheckoutText::of(&anchors(&top.join("caf\u{e9}"), &cargo, &std_dir)).is_none(), "a non-ASCII folder has no reliable spelling list");
+        // a checkout whose folder's name begins a shared root's (`s` beside std at `std`, `c` beside
+        // the cargo home `cargo`): a path in the root is the root's; text that continues the
+        // checkout's folder past the root, or a path in the checkout, is the checkout's; a std
+        // inside the checkout is the checkout's
+        let (s, c) = (top.join("s"), top.join("c"));
+        let in_std = format!("{}/core/src/lib.rs", std_dir.to_str().unwrap());
+        let in_registry = format!("{}/dep-1.0.0/src/lib.rs", registry.to_str().unwrap());
+        let s_text = CheckoutText::of(&anchors(&s, &cargo, &std_dir)).unwrap();
+        assert!(!s_text.found_in(in_std.as_bytes()) && !s_text.found_in(in_std.to_uppercase().as_bytes()), "a path in std is std's, not checkout s's");
+        assert!(s_text.found_in(format!("{}x", s.to_str().unwrap()).as_bytes()), "checkout s's folder with text after it (concat! without a separator) is s's");
+        assert!(s_text.found_in(format!("{}/src/lib.rs", s.to_str().unwrap()).as_bytes()), "a path in checkout s is s's");
+        let c_text = CheckoutText::of(&anchors(&c, &cargo, &std_dir)).unwrap();
+        assert!(!c_text.found_in(in_registry.as_bytes()), "a path in the cargo home's registry is the registry's, not checkout c's");
+        assert!(c_text.found_in(format!("{}/config.toml", cargo.to_str().unwrap()).as_bytes()), "the cargo home outside its registry and git folders is no shared root");
+        assert!(CheckoutText::of(&anchors(&top, &cargo, &std_dir)).unwrap().found_in(in_std.as_bytes()), "a std inside the checkout is the checkout's");
         let own = "target/relax";
         // (dep::twice holds the path: it misses in every run)
         let rest = [false, true, true, true, true, true, true, true];

@@ -120,6 +120,19 @@ impl Anchors {
         self.dirs.iter().filter(|(tag, _)| *tag == "cargo").map(|(_, dir)| dir.as_str()).chain(std::iter::once(self.std.as_str()))
     }
 
+    /// The folders of sources no checkout owns, absolute: std's sources and the cargo home's
+    /// registry and git folders, each unless it lies in a folder of the checkout (its paths are
+    /// then the checkout's). A path inside one is that folder's, whatever its name shares with
+    /// the checkout's (a checkout `.../s` beside std at `.../std`).
+    pub fn shared_roots(&self) -> Vec<String> {
+        let mut roots: Vec<String> = self.dirs.iter().filter(|(tag, _)| *tag == "cargo")
+            .flat_map(|(_, dir)| ["registry", "git"].map(|sub| format!("{}/{sub}", dir.trim_end_matches('/'))))
+            .chain(std::iter::once(self.std.clone()))
+            .collect();
+        roots.retain(|r| !self.checkout_dirs().any(|dir| crate::vfs::is_under_normalized(r, dir)));
+        roots
+    }
+
     /// The checkout's folders (the workspace, the run dir), absolute: text a sealed entry never
     /// holds.
     pub fn checkout_dirs(&self) -> impl Iterator<Item = &str> {
