@@ -159,7 +159,6 @@ impl Program {
         // a module still being judged answers 0 (glob cycles)
         if let Some(&r) = seen.get(&m) { return r; }
         seen.insert(m, 0);
-        let mut found: Option<DefId> = None;
         let mut out = 0u8;
         // what each glob gives `m` (its own lookup's answers: in a glob cycle a lookup entering at
         // the glob's module can find another binding); a name `m` binds itself (`skip_direct`):
@@ -172,18 +171,25 @@ impl Program {
                 _ => None,
             })
         }).collect());
+        // a glob's module that has the name ambiguous makes it so in `m` when `m` imports that
+        // binding: the first glob's, or a later one's of the same definition at the first one's
+        // visibility (rustc 1.100 `select_glob_decl`; rsim.rs `fold_ext` judges the same way)
+        let mut found: Option<(DefId, BindVis)> = None;
         for (g, r) in answers {
             let gd = self.def(g);
-            if gd.kind == DefKind::Mod && r.is_some() && self.glob_ambiguity_in(gd.sub, name, ns_type, false, seen) != 0 { out = out.max(2); }
-            if let Some((d, v)) = r {
-                if !self.vis_visible(v, m) {
-                    continue;
+            let Some((d, v)) = r else { continue };
+            if !self.vis_visible(v, m) {
+                continue;
+            }
+            let v = self.vis_min(md.globs.iter().find(|x| x.0 == g).and_then(|x| x.1), v);
+            let mut inherited = || gd.kind == DefKind::Mod && self.glob_ambiguity_in(gd.sub, name, ns_type, false, seen) != 0;
+            match found {
+                None => {
+                    found = Some((d, v));
+                    if inherited() { out = out.max(2); }
                 }
-                match found {
-                    None => found = Some(d),
-                    Some(f) if f != d => out = 1,
-                    _ => {}
-                }
+                Some((f, _)) if f != d => out = 1,
+                Some((_, fv)) => if fv == v && inherited() { out = out.max(2); },
             }
         }
         seen.insert(m, out);

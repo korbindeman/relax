@@ -550,7 +550,11 @@ impl<'a> Sim<'a> {
     /// -- visible to `m`, at most as visible as the glob, the first one found unless the same
     /// definition comes again more visible. `contest` collects the names two globs give different
     /// definitions, or visibilities neither of which is the wider; `ambiguous` the names two visible
-    /// globs give different definitions, and those a glob's module has ambiguous.
+    /// globs give different definitions, and those whose binding a glob brings from a module that
+    /// has the name ambiguous -- as rustc 1.100's `select_glob_decl` keeps it: the first glob's,
+    /// or a later one's of the same definition at the first one's visibility. A binding the glob's
+    /// module holds that `m` cannot see is no import of `m`, nor its ambiguity (a private module's
+    /// two globs of `shader` under the crate root's `pub use that::*`, beside a visible `shader`).
     fn fold_ext(&self, m: u32, work: &crate::fxhash::HashMap<u32, ExtTable>, mut contest: Option<&mut crate::fxhash::HashSet<(Sym, bool)>>) -> ExtTable {
         use std::collections::hash_map::Entry;
         let p = self.p;
@@ -559,16 +563,24 @@ impl<'a> Sim<'a> {
         let mut t = ExtTable::default();
         for (&n, &d) in &md.types { t.names.insert((n, true), (d, p.precise_vis(m, n, true, d))); }
         for (&n, &d) in &md.values { t.names.insert((n, false), (d, p.precise_vis(m, n, false, d))); }
+        // the visibility of each name's first glob binding (rustc's `old_glob_decl.vis()`: a later
+        // binding of the same definition at another visibility changes no ambiguity)
+        let mut first_vis: crate::fxhash::HashMap<(Sym, bool), BindVis> = Default::default();
         for &(g, gv) in &md.globs {
             let gd = p.def(g);
-            let mut take = |t: &mut ExtTable, k: (Sym, bool), d: DefId, v: BindVis| {
+            // `amb`: the glob's module has the name ambiguous
+            let mut take = |t: &mut ExtTable, k: (Sym, bool), d: DefId, v: BindVis, amb: bool| {
                 if own(&k) || !p.vis_visible(v, m) { return; }
                 let v = p.vis_min(gv, v);
                 match t.names.entry(k) {
-                    Entry::Vacant(e) => { e.insert((d, v)); }
+                    Entry::Vacant(e) => {
+                        e.insert((d, v));
+                        first_vis.insert(k, v);
+                        if amb { t.ambiguous.insert(k); }
+                    }
                     Entry::Occupied(mut e) => {
                         let (bd, bv) = *e.get();
-                        if bd != d { t.ambiguous.insert(k); }
+                        if bd != d || (amb && first_vis.get(&k) == Some(&v)) { t.ambiguous.insert(k); }
                         if bd == d && p.vis_wider(v, bv) {
                             e.insert((d, v));
                         } else if bd != d || (v != bv && !p.vis_wider(bv, v)) {
@@ -580,17 +592,16 @@ impl<'a> Sim<'a> {
             match gd.kind {
                 DefKind::Mod => {
                     let src = work.get(&gd.sub).or_else(|| self.ext_tables.get(&gd.sub).map(|x| &**x)).expect("a glob target's table is built before its importer's");
-                    for (&k, &(d, v)) in &src.names { take(&mut t, k, d, v); }
+                    // (what privacy.rs `glob_ambiguity_in` judges the same way)
+                    for (&k, &(d, v)) in &src.names { take(&mut t, k, d, v, src.ambiguous.contains(&k)); }
                     t.contested.extend(src.contested.iter().filter(|k| !own(k)));
-                    // (a name the glob's module binds: what privacy.rs `glob_ambiguity_in` inherits)
-                    t.ambiguous.extend(src.ambiguous.iter().filter(|k| !own(k) && src.names.contains_key(k)));
                     t.unsettled |= src.unsettled;
                 }
                 DefKind::Enum => {
                     for &v in &p.variants[gd.sub as usize] {
                         let n = p.def(v).name;
-                        take(&mut t, (n, true), v, None);
-                        take(&mut t, (n, false), v, None);
+                        take(&mut t, (n, true), v, None, false);
+                        take(&mut t, (n, false), v, None, false);
                     }
                 }
                 _ => {}
