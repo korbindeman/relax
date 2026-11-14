@@ -187,15 +187,16 @@ pub extern "C" fn relax_tool_release(h: u64) {
 
 #[cfg(test)]
 mod tests {
-    /// A build script's question carries rustc's words only: Relax's own flags among them
-    /// (`--no-asm`, `--allow-c`) change nothing of the run that answers.
+    /// A build script's question carries rustc's words only: Relax's own words among them
+    /// (`--no-asm`, the grants of options.rs GRANTS) change nothing of the run that answers, and
+    /// one that is no grant does not end it (a parsed `--allow-nonsense` exits 2).
     #[test]
     fn a_rustc_question_never_sets_the_runs_flags() {
         isolated_test!(a_rustc_question_never_sets_the_runs_flags);
         for name in ["RELAX_NO_ASM", "RELAX_ALLOW_C"] {
             assert_eq!(std::env::var_os(name), None, "{name} is set in the test's own environment");
         }
-        let args: Vec<String> = ["--print", "cfg", "--no-asm", "--allow-c"].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = ["--print", "cfg", "--no-asm", "--allow-c", "--allow-host-modules", "--allow-module-fuel=1", "--allow-nonsense"].iter().map(|s| s.to_string()).collect();
         let _ = crate::rustc_answer(&args, b"");
         assert_eq!(std::env::var_os("RELAX_NO_ASM"), None, "the question's --no-asm set RELAX_NO_ASM");
         assert_eq!(std::env::var_os("RELAX_ALLOW_C"), None, "the question's --allow-c set RELAX_ALLOW_C");

@@ -445,7 +445,7 @@ fn root_fns(u: &Unit, defs: &[DefId]) -> Vec<DefId> {
     defs.iter().copied().filter(|d| matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) && u.tcx.fn_sig(&u.prog, *d).map_or(false, |s| s.n_generics == 0)).collect()
 }
 
-/// Loads a trusted module (RELAX_MODULES_TRUSTED=1; on the owner thread): it runs as host code.
+/// Loads a trusted module (`--allow-host-modules`; on the owner thread): it runs as host code.
 unsafe fn load(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: bool) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
     let (krate, root_file, defs) = front(up, name, path, deps, sandbox)?;
     note_module_crate(krate);
@@ -860,7 +860,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let sess = &session;
     let runtime = &sess.runtime;
     let options = &sess.options;
-    // RELAX_SANDBOX_NOCHECK=1 (tests of the memory confinement alone): no compile-time refusal
+    // --allow-unchecked-modules (tests of the memory confinement alone): no compile-time refusal
     let check = !options.sandbox_nocheck;
     let t0 = std::time::Instant::now();
     let (krate, root_file, mut defs) = front(up, name, path, deps, check)?;
@@ -1078,7 +1078,7 @@ fn load_src_inner(name: *const u8, nlen: usize, path: *const u8, plen: usize, sr
     }
     let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
-    // RELAX_MODULES_TRUSTED=1: a trusted module (host code, no sandbox; diagnosis only)
+    // --allow-host-modules: a trusted module (host code, no sandbox; diagnosis only)
     let trusted = options.modules_trusted;
     let fix = |t: String| -> String {
         match &temp {

@@ -66,9 +66,11 @@ pub const MOUNT: [&[u8]; 3] = [WORKSPACE, VFS, EDITS];
 /// run reads its own folder, so it is a run fact: a runner the program starts somewhere else never
 /// finds it and mounts its own folder under this run's name.
 pub const SHARE: &[u8] = b"RELAX_SHARE";
-/// `--allow-c` (the person's grant for this invocation): this run builds and links C, and the
-/// self-exec child, this run again, does too; a relax the program starts (`$RELAX_LOADER run` of
-/// another package) does not inherit it.
+/// A bare `relax`'s `--allow-c` from its environment (the person's grant for this invocation; a
+/// `makepad run` host takes it as a word alone and drops this name at its start, relax-compiler
+/// lib.rs `drop_ambient_grants`): this run builds and links C, and the self-exec child, this run
+/// again, does too; a relax the program starts (`$RELAX_LOADER run` of another package) does not
+/// inherit it.
 pub const ALLOW_C: &[u8] = b"RELAX_ALLOW_C";
 /// The native build the program was built with when the run took it from the run that prepared
 /// it (a test's package binary: its test's): a run of this program again takes it too.
@@ -76,8 +78,8 @@ pub const RUN_NATIVE: &[u8] = b"RELAX_RUN_NATIVE";
 /// Run facts: what the host says of this run, for this run again (a self-exec child) and nothing
 /// else; the mount also for a child in this process's folder or in the mount. The self-exec
 /// command line (Relax std's spawn of this program; its first word is the program's own
-/// executable, relax-compiler selfexe.rs), whether the run added its `--silent`, its `--allow-c`
-/// and the native build it took.
+/// executable, relax-compiler selfexe.rs), whether the run added its `--silent`, a bare relax's
+/// `RELAX_ALLOW_C` and the native build it took.
 pub const RUN_FACTS: [&[u8]; 8] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", WORKSPACE, VFS, EDITS, SHARE, ALLOW_C, RUN_NATIVE];
 /// The build environment a run hands the runs of the programs it prepared (`BUILD`, `encode`d):
 /// their hosts build as it does. Never the program's: the child host takes it out at its start.
@@ -1031,7 +1033,7 @@ mod tests {
         assert_eq!(ran_travel, vec![(b("APP_MODE"), Some(b("demo"))), (b("PATH"), Some(b("/app/bin")))], "the run-env travels to the self-exec child program in PROGRAM_ENV");
         let ran_foreign = child_env(&real, &run_env, &Spawn { edits: &[], clear: false, self_exec: false, dir: ChildDir::Same, host: &[] });
         assert_eq!((get(&ran_foreign, "APP_MODE"), get(&ran_foreign, "PATH")), (Some(&b"demo"[..]), Some(&b"/app/bin"[..])), "a foreign child gets the program's view, run-env included");
-        // `--allow-c` is this invocation's: a relax the program starts does not inherit it
+        // a bare relax's RELAX_ALLOW_C is this invocation's: a relax the program starts does not inherit it
         let mut granted = real.clone();
         granted.push((b("RELAX_ALLOW_C"), b("1")));
         let nested = child_env(&granted, &own, &Spawn { edits: &[], clear: false, self_exec: false, dir: ChildDir::Same, host: &[] });

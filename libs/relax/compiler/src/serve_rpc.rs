@@ -396,9 +396,10 @@ fn connect(start: bool) -> Result<PathBuf, String> {
     let mut cmd = std::process::Command::new(crate::dirs::loader_exe().map_err(|e|e.to_string())?);
     cmd.arg("serve").arg("--workspace").arg(&root).stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e|e.to_string())?).stderr(log);
     serve_os::detach(&mut cmd);
-    // the check server outlives what started it: not one of its starter's processes, and its
-    // claims name no owner
+    // the check server outlives what started it: not one of its starter's processes, its claims
+    // name no owner, and it holds no grant (options.rs GRANTS: bare `relax` reads their names)
     cmd.env_remove("RELAX_RUN_OWNER");
+    for (_, name) in crate::options::GRANTS { cmd.env_remove(name); }
     for k in crate::progenv::host_env().detached_remove { cmd.env_remove(k); }
     let mut child = cmd.spawn().map_err(|e|e.to_string())?; let started = Instant::now();
     loop {
@@ -412,7 +413,7 @@ fn connect(start: bool) -> Result<PathBuf, String> {
 /// their one-shot meaning. An explicit --serve with such flags is rejected, never ignored.
 /// `-p <package>`: a package like one named plainly. Several: each checked by a process of its own,
 /// all of them whatever one says; the exit is the worst.
-fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
+fn check_packages(args: &[String], grants: &[String]) -> Result<Vec<String>, i32> {
     let mut out = Vec::new();
     let mut packages = Vec::new();
     let mut i = 0;
@@ -442,7 +443,7 @@ fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
     })?;
     let mut worst = 0;
     for p in packages {
-        let status = std::process::Command::new(&exe).arg("check").args(&out).arg(&p).status();
+        let status = std::process::Command::new(&exe).arg("check").args(grants).args(&out).arg(&p).status();
         let code = status.ok().and_then(|s| s.code()).unwrap_or(2);
         if code != 0 {
             eprintln!("relax check: {p}: exit {code}");
@@ -453,7 +454,8 @@ fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
 }
 
 pub fn check(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
-    let args = match check_packages(args) {
+    let grants = crate::options::grant_words(&sess.options, &sess.runtime);
+    let args = match check_packages(args, &grants) {
         Ok(a) => a,
         Err(code) => return code,
     };
@@ -467,7 +469,10 @@ pub fn check(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     // another one (RELAX_CHECK_TARGET) runs here
     let cross = sess.options.check_target != crate::options::CheckTarget::Host;
     if start && cross { eprintln!("relax: --serve checks this machine's target; a RELAX_CHECK_TARGET check runs in-process (--no-serve)"); return 2; }
-    let never = never || cross;
+    // nor does it hold a grant (it is started with none, whoever starts it): a check with one
+    // runs here, as one without never takes a server's
+    if start && !grants.is_empty() { eprintln!("relax: --serve checks without grants; a check with {} runs in-process (--no-serve)", grants.join(" ")); return 2; }
+    let never = never || cross || !grants.is_empty();
     if !never && rest.len() == 1 && !rest[0].starts_with('-') {
         let response = connect(start).and_then(|dir|request(&dir,"check",&format!("{{\"pkg\":{}}}",quote(rest[0]))));
         match response {

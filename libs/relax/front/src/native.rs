@@ -3,9 +3,9 @@
 //! The flag is the person's opt-in to C tooling: without it no package's C is compiled or linked
 //! (neither cargo nor the system C compiler runs, and no native library is loaded). It is no
 //! sandbox: `relax run` runs the package's Rust, its build scripts and proc macros included, with
-//! or without it. A package cannot grant it to itself (its run-env may not set RELAX_ALLOW_C), and
-//! a relax its program starts does not inherit it (progenv ALLOW_C). With it, the packages whose build
-//! script compiles or links native code (`links =`, a build-dependency on cc / cmake / pkg-config /
+//! or without it. A package cannot grant it to itself (it is a word of the person's command line:
+//! options.rs GRANTS), and a relax its program starts does not inherit it. With it, the packages
+//! whose build script compiles or links native code (`links =`, a build-dependency on cc / cmake / pkg-config /
 //! bindgen / vcpkg, or a script that reads `DEP_*` metadata of those) are built by cargo itself, so
 //! their build scripts run verbatim: `cargo check --release -p <package> --message-format=json`
 //! in the run's workspace, same Cargo.lock, same cargo flags. Cargo's `RUSTC_WRAPPER` is this

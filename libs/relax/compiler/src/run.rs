@@ -688,7 +688,7 @@ pub(crate) fn resolve_package(
     let resolved_units = units.clone();
     let units = with_sysroot_proc_macro(units, std_dir);
     let t_load = Instant::now();
-    let mut g = unitgraph::load(&units, check_only)?;
+    let mut g = unitgraph::load(&units, check_only, options.allow_c)?;
     // cargo's `[env]` configuration of the workspace, for every crate's compile-time environment
     // and every build script (a build script's own run has it in its process environment)
     if std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() {
@@ -1081,7 +1081,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
             "--verbose" => driver_options.verbose = true,
             // read into the session (session_from_env)
-            "--no-asm" | "--allow-c" => {}
+            a if a == "--no-asm" || crate::options::is_grant_word(a) => {}
             "--report-to" if i + 1 < args.len() => {
                 if let Err(e) = report_open(&args[i + 1]) {
                     eprintln!("relax: {}", e);
@@ -1351,8 +1351,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let own = (!check && !embedded).then(|| std::env::current_exe().and_then(|e| e.canonicalize()).map_err(|e| e.to_string()).and_then(|exe| {
         // a test's links' folder is its launchers' words' (selfexe test_key: unitgraph.rs writes them)
         let test = (harness || plain_test).then(|| {
-            let (profile, allow_c, ws) = (unitgraph::test_profile().unwrap_or(""), std::env::var("RELAX_ALLOW_C").unwrap_or_default(), workspace_dir());
-            let words: Vec<&str> = [package.as_str(), profile, allow_c.as_str(), ws.as_str()].into_iter().chain(cargo_flags.iter().map(String::as_str)).collect();
+            let (profile, grants, ws) = (unitgraph::test_profile().unwrap_or(""), crate::options::grant_words(&sess.options, &sess.runtime).join(" "), workspace_dir());
+            let words: Vec<&str> = [package.as_str(), profile, grants.as_str(), ws.as_str()].into_iter().chain(cargo_flags.iter().map(String::as_str)).collect();
             crate::selfexe::test_key(&words)
         });
         crate::selfexe::link(&exe, &crate::selfexe::program_name(&cargo_flags, &package), test.as_deref())

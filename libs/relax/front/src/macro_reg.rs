@@ -588,7 +588,7 @@ fn merged_host_units_keep_features_and_dependencies() {
         unit("shared", "lib", true, &["full", "visit"], &[(5, "host_helper")]),
         unit("host_helper", "lib", true, &["walk"], &[]),
     ], roots: vec![0], bins: Vec::new(), script: None };
-    let mut g = crate::unitgraph::load(&units, false).unwrap();
+    let mut g = crate::unitgraph::load(&units, false, false).unwrap();
     let sess = &std::sync::Arc::new(crate::Session::default());
     let saved = REG.with(|r| r.borrow_mut().take());
     register_and_strip(sess, &mut g.crates, &dir, false).unwrap();
@@ -599,7 +599,7 @@ fn merged_host_units_keep_features_and_dependencies() {
     let helper = g.crates.iter().find(|u| u.name == "host_helper").unwrap();
     assert_eq!(helper.src_path, format!("{dir}/proc_macro/empty.rs"));
     // Re-registering the original graph matches the host feature set, not the app's.
-    let again = crate::unitgraph::load(&units, false).unwrap();
+    let again = crate::unitgraph::load(&units, false, false).unwrap();
     register(sess, &again.crates, &dir, true).unwrap();
     REG.with(|r| {
         let r = r.borrow();
@@ -671,7 +671,7 @@ fn a_crate_only_a_build_script_links_is_no_root_of_the_app() {
         unit("generator", "lib", "build", "src/lib.rs", true, &[], &[(6, "rand")]),
         unit("rand", "lib", "build", "src/lib.rs", true, &["small_rng", "std"], &[]),
     ], roots: vec![0], bins: Vec::new(), script: None };
-    let mut g = crate::unitgraph::load(&units, false).unwrap();
+    let mut g = crate::unitgraph::load(&units, false, false).unwrap();
     let sess = &std::sync::Arc::new(crate::Session::default());
     let saved = REG.with(|r| r.borrow_mut().take());
     register_and_strip(sess, &mut g.crates, &dir, false).unwrap();

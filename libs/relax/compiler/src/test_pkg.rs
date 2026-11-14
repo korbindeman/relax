@@ -16,11 +16,13 @@
 //! default), `release` with `--release`, another with `--profile <name>` (run.rs `--profile`,
 //! resolve.rs `profile`). Before, every test ran release (relax issue 141).
 
-pub fn cmd_test_package(args: &[String]) -> i32 {
+pub fn cmd_test_package(args: &[String], grants: &[String]) -> i32 {
     stop::install();
-    // Loader options go before each run's package; feature flags go after it.
+    // Loader options go before each run's package; feature flags go after it. This invocation's
+    // grants (`--allow-*`, which the session took out of `args`) are each run's: words of its
+    // command line (options.rs GRANTS).
     let mut i = 0;
-    let mut pre: Vec<String> = Vec::new();
+    let mut pre: Vec<String> = grants.to_vec();
     let mut flags: Vec<String> = Vec::new();
     let mut feature_flags: Vec<String> = Vec::new();
     let mut live = false;

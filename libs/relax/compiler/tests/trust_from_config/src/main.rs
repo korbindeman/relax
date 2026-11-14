@@ -1,8 +1,9 @@
-// Relax's trust settings come from the person, never from the repository: cargo's `[env]` and a
-// build script's `rustc-env` name them (.cargo/config.toml, build.rs), and this run and its
-// self-exec child each still refuse a module's `unsafe` and stop a module call when its fuel runs
-// out, while the program reads the script's value as under cargo; the build script saw none of
-// them. Prints one line per check, the child's after the run's.
+// Relax's grants (options.rs GRANTS) come from the person's command line alone: cargo's `[env]`
+// and a build script's `rustc-env` name them (.cargo/config.toml, build.rs), a test puts them in
+// the environment, and the program names two for its self-exec child (one set in its own
+// environment, one in the spawn's). Prints what the build script saw and did, then for this run
+// and its child whether a module's `unsafe` loads, whether fuel stops a long module call, and what
+// the program reads of two of the names.
 const UNSAFE: &str = "pub fn frame(x: u64) -> u64 { let p = &x as *const u64; unsafe { *p } }";
 const SPIN: &str = "pub fn spin(n: u64) -> u64 { let mut x = 1u64; let mut i = 0; while i < n { x = x.wrapping_mul(6364136223846793005).wrapping_add(i); i += 1; } x }";
 
@@ -14,9 +15,9 @@ fn checks(who: &str) {
     }
     let m = std::relax::Module::load_source("spin", "spin.rs", SPIN, &[]).unwrap();
     let spin: fn(u64) -> u64 = m.get("spin").unwrap();
-    let stopped = std::relax::guard(0, || spin(100_000_000)).is_err();
-    println!("{who}: fuel {}", if stopped { "stops a long call" } else { "did NOT stop a long call" });
-    println!("{who}: program reads RELAX_SANDBOX_FUEL={}", std::env::var("RELAX_SANDBOX_FUEL").unwrap_or_else(|_| "nothing".into()));
+    println!("{who}: long call stopped: {}", std::relax::guard(0, || spin(100_000_000)).is_err());
+    let read = |n: &str| std::env::var(n).unwrap_or_else(|_| "nothing".into());
+    println!("{who}: program reads RELAX_SANDBOX_FUEL={} RELAX_MODULE_FUEL={}", read("RELAX_SANDBOX_FUEL"), read("RELAX_MODULE_FUEL"));
 }
 
 fn main() {
@@ -24,9 +25,11 @@ fn main() {
         checks("child");
         return;
     }
-    println!("script saw: {}", include_str!(concat!(env!("OUT_DIR"), "/seen.txt")));
+    println!("script: {}", include_str!(concat!(env!("OUT_DIR"), "/seen.txt")));
     checks("run");
-    let out = std::process::Command::new(std::env::current_exe().unwrap()).arg("child").output().unwrap();
+    // the program's own values: its child program reads them, the child's host takes none
+    std::env::set_var("RELAX_MODULE_FUEL", "1");
+    let out = std::process::Command::new(std::env::current_exe().unwrap()).arg("child").env("RELAX_MODULES_TRUSTED", "1").output().unwrap();
     print!("{}", String::from_utf8_lossy(&out.stdout));
     if !out.status.success() {
         println!("child failed: {}", String::from_utf8_lossy(&out.stderr));

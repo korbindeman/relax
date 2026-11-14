@@ -151,7 +151,7 @@ pub fn check_unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, 
     crate::resolve::check_unit_graph(sess, workspace, package, cargo_flags)
 }
 
-pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
+pub fn load(g: &Units, check_all_bins: bool, allow_c: bool) -> Result<Graph, String> {
     let units = &g.units;
     let roots = &g.roots;
     let mut crates: Vec<CrateUnit> = Vec::new();
@@ -347,7 +347,6 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                 // cargo builds a package's bins with the features its tests are built with (one
                 // feature set per package): the run of the bin selects exactly those
                 let features = crates[integration_tests[0]].features.join(",");
-                let allow_c = std::env::var_os("RELAX_ALLOW_C").is_some_and(|v| v == "1");
                 // a file the bin's starts read, replaced whole (another run's test may be reading it)
                 let put = |path: &std::path::Path, text: &str| {
                     if std::fs::read(path).ok().as_deref() == Some(text.as_bytes()) {
@@ -377,8 +376,8 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
                     }
                     words.extend([pkg_name.clone(), "--no-default-features".to_string()]);
                     // the test run's native permission is the binary's, as cargo builds the binary
-                    // with the test: a test that clears its child's environment (or takes
-                    // RELAX_ALLOW_C out of it) still starts the binary (relax issue 157)
+                    // with the test: a word of its command line, so a test that clears its child's
+                    // environment still starts the binary (relax issue 157)
                     if allow_c {
                         words.push("--allow-c".to_string());
                     }
@@ -1688,12 +1687,14 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     let chain = if chain.is_empty() { me } else { format!("{chain}>{me}") };
     let mut cmd = std::process::Command::new(&exe);
     // a run of its own: nothing this run says of itself crosses; its folder's mount is set below,
-    // and this invocation's `--allow-c` is the script's too
+    // and of this invocation's grants `--allow-c` is the script's too (the others are about this
+    // run's modules)
     crate::progenv::scrub_run_facts(&mut cmd);
+    cmd.arg("run");
     if sess.options.allow_c {
-        cmd.env("RELAX_ALLOW_C", "1");
+        cmd.arg("--allow-c");
     }
-    cmd.args(["run", "--quiet", "--silent", "--run-dir", target_dir, "--units", &units_path, "build-script-build"]);
+    cmd.args(["--quiet", "--silent", "--run-dir", target_dir, "--units", &units_path, "build-script-build"]);
     cmd.env("OUT_DIR", &out_dir)
         // Build scripts may test this to skip work only rustc needs.
         .env("RELAX_BUILD_SCRIPT", "1")

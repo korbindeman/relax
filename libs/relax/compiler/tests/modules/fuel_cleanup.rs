@@ -1,4 +1,4 @@
-// A module's cleanups never end the host. With RELAX_MODULE_FUEL=1000000: a call whose fuel runs
+// A module's cleanups never end the host. With --allow-module-fuel=1000000: a call whose fuel runs
 // out in a callee while its frame holds a value to drop, one whose destructor spins until the fuel
 // runs out while a panic unwinds, and one whose destructor panics while a panic unwinds (rustc
 // aborts the process for the last two, as it did here for all three) each end with an error at

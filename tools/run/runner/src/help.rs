@@ -149,7 +149,7 @@ fn relax_main_page(st: &Style) -> String {
     p.row("--verbose", "Phase timings and info (also RELAX_VERBOSE=1)");
     p.row("--quiet", "Hide the compile-error stream");
     p.row("--no-asm", "Refuse inline assembly (asm!/global_asm!/naked_asm!),\nfor sandboxed uses (also RELAX_NO_ASM=1)");
-    p.row("--allow-c", "Build C dependencies with cargo and the system C\ncompiler and link them in (also RELAX_ALLOW_C=1)");
+    p.row("--allow-c", "Build C dependencies with cargo and the system C\ncompiler and link them in (bare relax: also\nRELAX_ALLOW_C=1)");
     p.row("--version", "Print the version and exit");
     p.row("-h, --help", "Print this help");
     p.section("Environment:");
@@ -193,7 +193,7 @@ fn main_page(st: &Style) -> String {
     p.row("--verbose", "Phase timings and info (also RELAX_VERBOSE=1)");
     p.row("--quiet", "Hide the compile-error stream");
     p.row("--no-asm", "Refuse inline assembly (asm!/global_asm!/naked_asm!),\nfor sandboxed uses (also RELAX_NO_ASM=1)");
-    p.row("--allow-c", "Build C dependencies with cargo and the system C\ncompiler and link them in (also RELAX_ALLOW_C=1)");
+    p.row("--allow-c", "Build C dependencies with cargo and the system C\ncompiler and link them in (bare relax: also\nRELAX_ALLOW_C=1)");
     p.row("--version", "Print the version and exit");
     p.row("-h, --help", "Print this help");
     p.section("Environment:");
@@ -225,7 +225,7 @@ fn run_page(st: &Style) -> String {
     p.row("--heap[=<bytes>]", "Track the heap by stack from the start (inspect heap)");
     p.row("--cfg <spec>", "Set a cfg for the program (name or name=\"value\"), as RUSTFLAGS=--cfg");
     p.row("--no-asm", "Refuse the program's inline assembly (asm!,\nglobal_asm!, naked_asm!: an error naming the crate),\nfor sandboxed uses; also RELAX_NO_ASM=1");
-    p.row("--allow-c", "Build dependencies that compile C with cargo and the\nsystem C compiler; also RELAX_ALLOW_C=1");
+    p.row("--allow-c", "Build dependencies that compile C with cargo and the\nsystem C compiler (a grant: a word of the command\nline; bare relax also reads RELAX_ALLOW_C=1)");
     p.row("--privileged", "Grant the app the HAL's domain control: it may start,\nstop and embed other apps as domains (a window\nmanager)");
     p.row("--relaxed[=<list>]", "Relaxed Rust for every crate (all, or a list)");
     p.row("--mount <dir>=<git-url>", "Mount another repository at a folder of the\nfirst (repeatable); an optional #ref pins it");
