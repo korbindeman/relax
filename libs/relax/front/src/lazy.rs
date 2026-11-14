@@ -130,6 +130,12 @@ impl PendingPlan {
         let _reads = self.pending_contexts.first().map(|c| c.bind_source_reads());
         let _ = std::ops::Deref::deref(self);
         self.early.wake_all();
+        // The allocator's free pages go back to the system now that the plan is ready: on a large
+        // app's cold load about 0.6 GB is free then (parse and planning churn) and still resident,
+        // under the load's peak. On this thread, whose work is done.
+        let (r0, t) = (if trace() { crate::memstat::resident() } else { 0 }, std::time::Instant::now());
+        crate::memstat::trim();
+        if trace() { eprintln!("boot-trace: plan ready, heap trimmed: rss {} -> {} MB in {:.1} ms", r0 >> 20, crate::memstat::resident() >> 20, t.elapsed().as_secs_f64() * 1e3); }
     }
     /// The planning thread panicked (`complete`).
     pub fn failed(&self) -> bool { self.failed.load(std::sync::atomic::Ordering::Acquire) }
