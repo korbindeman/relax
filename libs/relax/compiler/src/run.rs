@@ -841,7 +841,9 @@ pub(crate) fn resolve_package(
                 (None, Some(r)) if boot && native_request.is_some() => Some(unitgraph::Inherit::Binary(r)),
                 _ => None,
             };
-            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, native_mode, check_only, inherit, hook);
+            // (what runs the scripts: read only when there are any, its std walk is a millisecond)
+            let tool = if g.build_scripts.is_empty() { 0 } else { crate::std_source::script_tool() };
+            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir, tool, native_mode, check_only, inherit, hook);
             let scripts_ms = t_scripts.elapsed().as_secs_f64() * 1e3;
             let t_wait = Instant::now();
             (sources.map(|h| h.join().expect("provided source check")), scripts, scripts_ms, t_wait.elapsed().as_secs_f64() * 1e3)

@@ -477,7 +477,7 @@ fn host_triple(sess: &std::sync::Arc<crate::Session>) -> &'static str {
 
 /// Compiles (once per source) and runs every build script; records cfgs, link libraries,
 /// OUT_DIR and rustc-env per crate. Scripts run in parallel. `target_dir` is the run's relax dir,
-/// `<target>/relax` (OUT_DIR = <target>/relax/build/<crate>-<hash>/out: as deep as cargo's
+/// `<target>/relax` (OUT_DIR = <target>/relax/build/<crate>-<hash>-<key hash>/out: as deep as cargo's
 /// <target>/release/build/<crate>-<hash>/out, since scripts look 5 ancestors up for the
 /// workspace root).
 /// What Relax does with a package's build script. A package keeps its script by its manifest
@@ -648,10 +648,15 @@ pub type ScriptsDone<'a> = dyn Fn(&Graph, &[usize], &[Vec<String>], &[Vec<(Strin
 ///
 /// `native_receipt`: the native build of the run that started this one (`Inherit`).
 ///
+/// `tool`: what runs a script here, apart from where that program lies: the identity of the Relax
+/// that compiles and runs it (its codegen identity, which holds its answers to the script's RUSTC
+/// questions) and of the std the script compiles against. A script's output is kept under it
+/// (`script_env_key`), never under the program's path.
+///
 /// Its result: the receipt of the native build this run made, for the runs that take it: the
 /// package binaries its integration tests start (CARGO_BIN_EXE_<name>, `BIN_NATIVE_RECEIPT`) and a
 /// run of this program again (run.rs, `RELAX_RUN_NATIVE`).
-pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, target_dir: &str, native: Option<crate::native::Mode<'_>>, check_only: bool,
+pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, target_dir: &str, tool: u128, native: Option<crate::native::Mode<'_>>, check_only: bool,
     native_receipt: Option<Inherit<'_>>, scripts_done: Option<&ScriptsDone<'_>>) -> Result<Option<String>, String> {
     // the packages whose scripts compile or link C (native.rs): built by cargo with `--allow-c`,
     // an error naming the flag without it; Relax runs the other scripts. A check without the flag
@@ -795,7 +800,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     // the other scripts: they share nothing (each script's output is its own crate's)
     let gr: &Graph = g;
     let meta: LinksMeta = Default::default();
-    let root = BuildRoot::new(sess, gr, target_dir, check_only);
+    let root = BuildRoot::new(sess, gr, target_dir, check_only, tool);
     let (native_built, results) = std::thread::scope(|scope| {
         let native_job = match (native, native_seeds.is_empty()) {
             (Some(crate::native::Mode::Build(req)), false) if !prebuilt => Some(scope.spawn(|| {
@@ -1647,8 +1652,9 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     }
     let unit_dir = format!("{}/build-scripts/{:016x}", target_dir, h);
     let units_path = format!("{}/units.json", unit_dir);
-    // a package of a shared workspace (vfs.rs SHARE): its script's output is kept per content of
-    // its inputs (`shared_build_dir`), and `base_dir` holds the claim and what the script declared
+    // a script's output is kept per key of its inputs (`script_build_dir`), and `base_dir` holds
+    // the claim and what the script declared; a package of a shared workspace (vfs.rs SHARE) keys
+    // its checkout's files by what they hold
     let shared: Option<SharedContent> = crate::vfs::in_folder(dir).then(Default::default);
     let base_dir = root.take(&format!("{}-{:016x}", name, fh));
     let mut out_dir = format!("{}/out", base_dir);
@@ -1668,7 +1674,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             }
         }
     }
-    let _ = std::fs::create_dir_all(if shared.is_some() { &base_dir } else { &out_dir });
+    let _ = std::fs::create_dir_all(&base_dir);
     let exe = match self_exe() {
         Ok(e) => e,
         Err(e) => return (Err(format!("this executable: {e}")), out_dir, confined),
@@ -1782,15 +1788,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // cargo's rerun rules: the previous output stands while the script's units, the environment
     // it was given and its `rerun-if-changed` / `rerun-if-env-changed` inputs are unchanged (a
     // script that names none: no file of its package changed)
-    let mut env_key = format!("{:016x}", h);
-    for (k, v) in cmd.get_envs() {
-        // no receipt is no part of the key (it held none before there were receipts); a shared
-        // workspace's OUT_DIR is named by this key (`shared_build_dir`)
-        if SCRIPT_RUN_SHAPE_VARS.iter().any(|s| k == *s) || (k == NATIVE_RECEIPT && v.is_none()) || (shared.is_some() && k == "OUT_DIR") {
-            continue;
-        }
-        env_key.push_str(&format!("\n{}={}", k.to_string_lossy(), v.map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()));
-    }
+    let env_key = script_env_key(h, root.tool, cmd.get_envs(), &exe);
     // Ok: the output in `build_dir`, which stands; Err: why the script runs again
     let previous = |build_dir: &str| match (std::fs::read_to_string(format!("{}/output", build_dir)), std::fs::read_to_string(format!("{}/relax-rerun", build_dir))) {
         (Ok(old), Ok(key)) => {
@@ -1799,8 +1797,8 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             if !refusals(&old, &format!("{}/out", build_dir)).is_empty() {
                 return Err("its kept output reaches past its folders".to_string());
             }
-            let own = std::path::Path::new(&format!("{}/{}", build_dir, CHECKOUT_MARK)).is_file();
-            let keyed = if own { format!("{CHECKOUT_LINE}\n{old}") } else { old.clone() };
+            let marked = |mark: &str| std::path::Path::new(&format!("{}/{}", build_dir, mark)).is_file();
+            let keyed = keyed_output(&old, marked(CHECKOUT_MARK), marked(PROGRAM_MARK));
             let now = rerun_key(&keyed, dir, &env_key, shared.as_ref(), given.as_deref()).unwrap_or_default();
             if now == key { Ok(old) } else { Err(rerun_reason(&key, &now, &std::fs::read_to_string(format!("{}/relax-rerun-env", build_dir)).unwrap_or_default(), &env_key)) }
         }
@@ -1809,16 +1807,13 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     let declared_path = format!("{}/relax-declared", base_dir);
     // where this run's output is (its build dir, named in the pass's root before it is read), and
     // whether one stands there
-    let place = || match &shared {
-        None => (base_dir.clone(), previous(&base_dir)),
-        Some(content) => {
-            let (at, standing) = shared_build_dir(&base_dir, &std::fs::read_to_string(&declared_path).unwrap_or_default(),
-                &|declared| rerun_key(declared, dir, &env_key, Some(content), given.as_deref()).unwrap_or_default(), &previous);
-            let at = root.take(at.rsplit('/').next().unwrap_or_default());
-            // (a prune may have taken it before the root named it)
-            let standing = standing.and_then(|old| if std::path::Path::new(&format!("{}/output", at)).is_file() { Ok(old) } else { Err("no previous output".to_string()) });
-            (at, standing)
-        }
+    let place = || {
+        let (at, standing) = script_build_dir(&base_dir, &std::fs::read_to_string(&declared_path).unwrap_or_default(),
+            &|declared| rerun_key(declared, dir, &env_key, shared.as_ref(), given.as_deref()).unwrap_or_default(), &previous);
+        let at = root.take(at.rsplit('/').next().unwrap_or_default());
+        // (a prune may have taken it before the root named it)
+        let standing = standing.and_then(|old| if std::path::Path::new(&format!("{}/output", at)).is_file() { Ok(old) } else { Err("no previous output".to_string()) });
+        (at, standing)
     };
     let (mut build_dir, standing) = place();
     let mut why = match standing {
@@ -1860,14 +1855,15 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         }
     }
     if let Some(claim) = claim.as_ref() { name_claim(claim); }
-    if shared.is_some() {
-        out_dir = format!("{}/out", build_dir);
-        let _ = std::fs::create_dir_all(&out_dir);
-        cmd.env("OUT_DIR", &out_dir);
-    }
+    out_dir = format!("{}/out", build_dir);
+    let _ = std::fs::create_dir_all(&out_dir);
+    cmd.env("OUT_DIR", &out_dir);
     let output_path = format!("{}/output", build_dir);
     let key_path = format!("{}/relax-rerun", build_dir);
     let env_path = format!("{}/relax-rerun-env", build_dir);
+    // an output stands with its key, written after it: a folder this run makes again holds none
+    // until the run is done (a start whose inputs read the same never takes it half made)
+    let _ = std::fs::remove_file(&key_path);
     // why this script runs again, kept beside its output (relax-rerun-why: the last 20) and shown with RELAX_PROFILE
     if sess.runtime.profile { eprintln!("relax build-script: {} runs: {}", pname, why); }
     note_rerun(&build_dir, &why);
@@ -1887,15 +1883,19 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
                 return (Err(format!("{}: the build script of `{}` ran confined and printed what a confined build script may not:\n  {}", bs.src_path, pname, refused.join("\n  "))), out_dir, confined);
             }
             let stdout = if shared.is_some() { shared_output(&stdout) } else { stdout };
-            // an output that names its checkout stands for that checkout alone (`names_checkout`)
+            // an output that names its checkout stands for that checkout alone (`names_checkout`),
+            // one that names the program that ran it for that program alone (`names_program`)
             let own = shared.is_some() && names_checkout(&stdout, &out_dir);
-            let mark = format!("{}/{}", build_dir, CHECKOUT_MARK);
-            if own {
-                let _ = std::fs::write(&mark, crate::vfs::folder_disks().join("\n"));
-            } else {
-                let _ = std::fs::remove_file(&mark);
+            let program = names_program(&stdout, &out_dir, &exe);
+            for (named, mark, what) in [(own, CHECKOUT_MARK, crate::vfs::folder_disks().join("\n")), (program, PROGRAM_MARK, exe.to_string_lossy().into_owned())] {
+                let mark = format!("{}/{}", build_dir, mark);
+                if named {
+                    let _ = std::fs::write(&mark, what);
+                } else {
+                    let _ = std::fs::remove_file(&mark);
+                }
             }
-            let keyed = if own { format!("{CHECKOUT_LINE}\n{stdout}") } else { stdout.clone() };
+            let keyed = keyed_output(&stdout, own, program);
             if let Some(given) = &given {
                 say_withheld(pname, &stdout, given);
             }
@@ -1906,12 +1906,10 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             } else {
                 let _ = std::fs::remove_file(&key_path);
             }
-            // what the script declared names the place of its next output (`shared_build_dir`)
-            if shared.is_some() {
-                let declared = declared_inputs(&keyed);
-                if std::fs::read_to_string(&declared_path).ok().as_deref() != Some(declared.as_str()) {
-                    let _ = std::fs::write(&declared_path, &declared);
-                }
+            // what the script declared names the place of its next output (`script_build_dir`)
+            let declared = declared_inputs(&keyed);
+            if std::fs::read_to_string(&declared_path).ok().as_deref() != Some(declared.as_str()) {
+                let _ = std::fs::write(&declared_path, &declared);
             }
             (Ok(stdout), out_dir, confined)
         }
@@ -2081,6 +2079,11 @@ fn rerun_key(output: &str, pkg_dir: &str, env_key: &str, shared: Option<&SharedC
             key.push_str(&format!("k {}\n", crate::vfs::folder_disks().join(" ")));
             continue;
         }
+        if line == PROGRAM_LINE {
+            // (an output kept per program: the path of the one that runs the script)
+            key.push_str(&format!("x {}\n", self_exe().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default()));
+            continue;
+        }
         let rest = match line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")) {
             Some(r) => r,
             None => continue,
@@ -2196,6 +2199,56 @@ fn shared_content(shared: Option<&SharedContent>, path: &str, pkg: bool, follow:
 const CHECKOUT_LINE: &str = "relax:per-checkout";
 const CHECKOUT_MARK: &str = "relax-checkout";
 
+/// The same for an output kept per program (`names_program`): its key holds the path of the
+/// program that runs the script. `PROGRAM_MARK`, beside such an output, says so.
+const PROGRAM_LINE: &str = "relax:per-program";
+const PROGRAM_MARK: &str = "relax-program";
+
+/// A script's output as its key reads it: the lines of the marks it carries first.
+fn keyed_output(output: &str, per_checkout: bool, per_program: bool) -> String {
+    let mut keyed = String::new();
+    for (on, line) in [(per_checkout, CHECKOUT_LINE), (per_program, PROGRAM_LINE)] {
+        if on {
+            keyed.push_str(line);
+            keyed.push('\n');
+        }
+    }
+    keyed.push_str(output);
+    keyed
+}
+
+/// Whether a script's output names the program that ran it (`exe`, its RUSTC and CARGO): its
+/// stdout or a file it left in its OUT_DIR holds that program's path (a script that records
+/// `$RUSTC`). Its key is the program's identity, not its path (`script_env_key`), so such an
+/// output stands for that path alone, else another copy of the program took the first one's path.
+fn names_program(stdout: &str, out_dir: &str, exe: &std::path::Path) -> bool {
+    let mut paths = vec![exe.to_string_lossy().into_owned()];
+    if let Ok(c) = std::fs::canonicalize(exe) {
+        paths.push(c.to_string_lossy().into_owned());
+    }
+    paths.dedup();
+    paths.iter().any(|p| stdout.contains(p.as_str())) || folder_mentions(std::path::Path::new(out_dir), &paths)
+}
+
+/// A script run's environment as its rerun key holds it: the hash of its units, what runs it
+/// (`tool`, run_build_scripts) and the variables it is given. Left out: the variables that only
+/// shape the run (SCRIPT_RUN_SHAPE_VARS), a receipt it is not given, OUT_DIR (the key names the
+/// output's folder, `script_build_dir`), and RUSTC and CARGO while they name the program that runs
+/// it (`exe`): where that program lies is no input of the script, what it is (`tool`) is. Two
+/// copies of one Relax find each other's outputs; a Relax that compiles the script or answers its
+/// RUSTC otherwise keeps its own beside them.
+fn script_env_key<'a>(h: u64, tool: u128, envs: impl Iterator<Item = (&'a std::ffi::OsStr, Option<&'a std::ffi::OsStr>)>, exe: &std::path::Path) -> String {
+    let mut key = format!("{:016x}\ntool={:032x}", h, tool);
+    for (k, v) in envs {
+        let the_program = (k == "RUSTC" || k == "CARGO") && v == Some(exe.as_os_str());
+        if SCRIPT_RUN_SHAPE_VARS.iter().any(|s| k == *s) || (k == NATIVE_RECEIPT && v.is_none()) || k == "OUT_DIR" || the_program {
+            continue;
+        }
+        key.push_str(&format!("\n{}={}", k.to_string_lossy(), v.map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()));
+    }
+    key
+}
+
 /// Whether a shared workspace's script output (vfs.rs SHARE) is its checkout's own: its stdout
 /// (rerun-if-changed paths already the mount's) or a file it left in its OUT_DIR names the
 /// checkout's folder on disk (a `rustc-env` of the source root, generated code holding its paths),
@@ -2280,7 +2333,7 @@ fn shared_output(output: &str) -> String {
 /// The inputs a script's output declares (its `rerun-if` lines, sorted, once each).
 fn declared_inputs(output: &str) -> String {
     let mut lines: Vec<&str> = output.lines().filter(|l| {
-        if *l == CHECKOUT_LINE {
+        if *l == CHECKOUT_LINE || *l == PROGRAM_LINE {
             return true;
         }
         let rest = l.strip_prefix("cargo::").or_else(|| l.strip_prefix("cargo:")).unwrap_or("");
@@ -2291,17 +2344,19 @@ fn declared_inputs(output: &str) -> String {
     lines.join("\n")
 }
 
-/// Where the output of a shared workspace's script is (vfs.rs SHARE), and whether one stands
-/// there (`previous`: the output of a build dir, or why it does not stand). The checkouts of one
-/// repository have one run dir. With one output per package, a checkout whose inputs differ ran
-/// the script into the folder another checkout's run was reading, and each made it again after
-/// the other. So an output is kept per content of its inputs, in `<base_dir>-<hash>`: the hash of
-/// the rerun key (`key_of`) that `declared`, the inputs the script's last output named, gives for
-/// this checkout now (none yet: the package's files, cargo's rule for a script that names none).
+/// Where a script's output is, and whether one stands there (`previous`: the output of a build
+/// dir, or why it does not stand). The runs of one run dir share its build dirs: the checkouts of
+/// one repository (vfs.rs SHARE), and the Relax builds run on one project. With one output per
+/// package, a run whose inputs differ (another checkout's files, another Relax: `script_env_key`)
+/// ran the script into the folder another run was reading, and each made it again after the
+/// other: every switch between a release and a dev build ran its scripts again. So an output is
+/// kept per key of its inputs, in `<base_dir>-<hash>`: the hash of the rerun key (`key_of`) that
+/// `declared`, the inputs the script's last output named, gives for this run now (none yet: the
+/// package's files, cargo's rule for a script that names none).
 /// An output made before its script's inputs were known, or one whose script names other inputs
 /// from run to run, has another name: when the named one does not stand, any output of this
 /// script that does is taken. The build prune (`prune_build`) keeps what the roots name.
-fn shared_build_dir(base_dir: &str, declared: &str, key_of: &dyn Fn(&str) -> String, previous: &dyn Fn(&str) -> Result<String, String>) -> (String, Result<String, String>) {
+fn script_build_dir(base_dir: &str, declared: &str, key_of: &dyn Fn(&str) -> String, previous: &dyn Fn(&str) -> Result<String, String>) -> (String, Result<String, String>) {
     let named = format!("{}-{:016x}", base_dir, crate::sip::hash_bytes(key_of(declared).as_bytes()) as u64);
     let why = match previous(&named) {
         Ok(old) => return (named, Ok(old)),
@@ -2327,17 +2382,27 @@ fn shared_build_dir(base_dir: &str, declared: &str, key_of: &dyn Fn(&str) -> Str
 
 /// The build dirs one script pass uses (`<run dir>/build/<name>`): named in the pass's root,
 /// `build/roots/<slot>`, before each is used, and use-locked for the life of the process. Its slot:
-/// the checkout on disk and what the pass is for (the build script chain it runs in, the target, a
-/// check, the root package), never content, so a pass of the same selection replaces its root.
+/// the checkout on disk, what the pass is for (the build script chain it runs in, the target, a
+/// check, the root package) and what runs its scripts (`tool`), never content, so a pass of the
+/// same selection replaces its root, and one of another Relax keeps the outputs of this one.
 /// The root's text: the checkout's folder on disk, then the build dirs' names. `prune_build`
-/// (cache.rs prune_root) removes the build dirs no root names.
+/// (cache.rs prune_root) removes the build dirs no root names, and a root no pass refreshed for
+/// ROOT_UNUSED (a Relax no longer run here).
 pub struct BuildRoot {
     build: std::path::PathBuf,
     path: std::path::PathBuf,
     head: String,
     /// (what the root file says now, the names this pass took)
     names: Mutex<(Vec<String>, Vec<String>)>,
+    /// what runs this pass's scripts (run_build_scripts `tool`)
+    tool: u128,
 }
+
+/// A build root no pass refreshed for this long goes (`prune_build`), and with it the outputs
+/// only it named: what costs that Relax, run here again, is its scripts' runs, never a failure.
+const ROOT_UNUSED: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+/// A pass refreshes a root it leaves unchanged once it is this old (a warm pass writes nothing else).
+const ROOT_REFRESH: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// The use locks this process holds (shared locks on `<build dir>/relax-use`), kept for its life.
 static USE_LOCKS: Mutex<Vec<(std::path::PathBuf, std::fs::File)>> = Mutex::new(Vec::new());
@@ -2364,12 +2429,13 @@ fn build_lock(build: &std::path::Path, wait: bool) -> Option<std::fs::File> {
 }
 
 impl BuildRoot {
-    pub fn new(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, check_only: bool) -> BuildRoot {
+    pub fn new(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, check_only: bool, tool: u128) -> BuildRoot {
         let checkout = crate::vfs::on_disk(&crate::dirs::workspace_dir()).into_owned();
         let chain = std::env::var("RELAX_SCRIPT_CHAIN").unwrap_or_default();
         let subject = g.pkg.get(g.root).map(|(d, n, v)| format!("{}\t{n}@{v}", crate::dirs::anchored(d))).unwrap_or_default();
-        let what = [chain.as_str(), target_triple(sess), if check_only { "check" } else { "run" }, subject.as_str()];
-        BuildRoot::at(std::path::Path::new(target_dir).join("build"), checkout, &what)
+        let tool_id = format!("{tool:032x}");
+        let what = [chain.as_str(), target_triple(sess), if check_only { "check" } else { "run" }, subject.as_str(), tool_id.as_str()];
+        BuildRoot { tool, ..BuildRoot::at(std::path::Path::new(target_dir).join("build"), checkout, &what) }
     }
 
     /// The root of a pass in `build` of the checkout `checkout` (on disk) for `what`.
@@ -2382,7 +2448,7 @@ impl BuildRoot {
         }
         let path = build.join("roots").join(format!("{:032x}", slot.finish128()));
         let now: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().skip(1).map(str::to_string).collect();
-        BuildRoot { build, path, head: checkout, names: Mutex::new((now, Vec::new())) }
+        BuildRoot { build, path, head: checkout, names: Mutex::new((now, Vec::new())), tool: 0 }
     }
 
     fn text(&self, names: &[String]) -> String {
@@ -2435,19 +2501,25 @@ impl BuildRoot {
         dir.to_string_lossy().into_owned()
     }
 
-    /// The pass is over: its root names exactly what it took.
+    /// The pass is over: its root names exactly what it took, and is fresh (`ROOT_UNUSED`).
     pub fn finish(&self) {
         let mut names = self.names.lock().unwrap();
         names.1.sort();
         names.0 = names.1.clone();
         self.write(&names.0);
+        if let Ok(f) = std::fs::File::options().write(true).open(&self.path) {
+            if f.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > ROOT_REFRESH)) {
+                let _ = f.set_modified(std::time::SystemTime::now());
+            }
+        }
     }
 }
 
 /// Keeps `build/` to what the roots name (`BuildRoot`): every other build dir goes, unless a run
 /// holds its use lock or it changed since `since` (a Relax build without roots may be writing it),
-/// and so does the root of a checkout that is gone. A base dir (`<name>-<16 hex>`, the claim and
-/// what a shared script declared) stays while a dir of it (`<base>-<16 hex>`) does. Under the build
+/// and so does the root of a checkout that is gone, and one no pass refreshed for ROOT_UNUSED
+/// (said once per prune that drops any). A base dir (`<name>-<16 hex>`, the claim and
+/// what its script declared) stays while a dir of it (`<base>-<16 hex>`) does. Under the build
 /// lock, taken only if free (else the next start prunes), or with `wait` once it is (a child being
 /// spawned may hold it a moment after its holder let go, native.rs `prune`): what goes is moved
 /// to `build/trash` there and deleted after it. Returns how many dirs went.
@@ -2461,12 +2533,20 @@ pub fn prune_build(build: &std::path::Path, since: std::time::SystemTime, wait: 
     {
         let Some(_lock) = build_lock(build, wait) else { return 0 };
         let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut dropped = 0;
         for e in std::fs::read_dir(build.join("roots")).into_iter().flatten().flatten() {
             let p = e.path();
             // (`.<slot>.<pid>`: a root being written, or what a writer that ended midway left)
             if e.file_name().to_string_lossy().starts_with('.') {
                 if !recent(&p) {
                     let _ = std::fs::remove_file(&p);
+                }
+                continue;
+            }
+            let unused = std::fs::metadata(&p).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > ROOT_UNUSED));
+            if unused {
+                if std::fs::remove_file(&p).is_ok() {
+                    dropped += 1;
                 }
                 continue;
             }
@@ -2477,6 +2557,10 @@ pub fn prune_build(build: &std::path::Path, since: std::time::SystemTime, wait: 
                 // a checkout that is gone
                 _ => { let _ = std::fs::remove_file(&p); }
             }
+        }
+        if dropped > 0 {
+            crate::progress::say(&format!("relax build: {dropped} build-script root(s) in {} no run refreshed for {} days dropped: the outputs only they named go, and a Relax that needs them again runs those scripts again",
+                build.display(), ROOT_UNUSED.as_secs() / 86400));
         }
         let mut doomed: Vec<String> = Vec::new();
         let names: Vec<String> = std::fs::read_dir(build).into_iter().flatten().flatten()
@@ -2816,25 +2900,93 @@ mod shared_script_tests {
         let base_dir = format!("{}/s-0123456789abcdef", crate::vfs::normalize_path(&build.to_string_lossy()));
         let stands = |at: &str| std::fs::read_to_string(format!("{at}/output")).map_err(|_| "no previous output".to_string());
         let key_of = |declared: &str| format!("key of {declared}");
-        let (named, r) = shared_build_dir(&base_dir, "decl", &key_of, &stands);
+        let (named, r) = script_build_dir(&base_dir, "decl", &key_of, &stands);
         assert_eq!((r, named.len()), (Err("no previous output".to_string()), base_dir.len() + 17));
         assert!(named.starts_with(&format!("{base_dir}-")));
-        assert_eq!(named, shared_build_dir(&base_dir, "decl", &key_of, &stands).0, "one name per key");
-        assert_ne!(named, shared_build_dir(&base_dir, "other", &key_of, &stands).0);
+        assert_eq!(named, script_build_dir(&base_dir, "decl", &key_of, &stands).0, "one name per key");
+        assert_ne!(named, script_build_dir(&base_dir, "other", &key_of, &stands).0);
         let older = format!("{base_dir}-00000000000000aa");
         std::fs::create_dir_all(&older).unwrap();
         std::fs::write(format!("{older}/output"), "old").unwrap();
-        assert_eq!(shared_build_dir(&base_dir, "decl", &key_of, &stands), (older.clone(), Ok("old".to_string())), "an output made under another name");
+        assert_eq!(script_build_dir(&base_dir, "decl", &key_of, &stands), (older.clone(), Ok("old".to_string())), "an output made under another name");
         std::fs::create_dir_all(&named).unwrap();
         std::fs::write(format!("{named}/output"), "named").unwrap();
-        assert_eq!(shared_build_dir(&base_dir, "decl", &key_of, &stands), (named, Ok("named".to_string())), "the named one first");
+        assert_eq!(script_build_dir(&base_dir, "decl", &key_of, &stands), (named, Ok("named".to_string())), "the named one first");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A script's output is kept per what runs it, not where that program lies: two copies of one
+    /// Relax (one identity, two paths) key and name one output, and the second finds the first's;
+    /// a Relax of another identity keys its own beside it, and switching back and forth leaves
+    /// both standing (each ran the script once). RUSTC and CARGO are out of the key while they name
+    /// the program and in it when they name another; OUT_DIR is never in it. An output that names
+    /// its program's path is kept for that path alone.
+    #[test]
+    fn a_scripts_output_is_kept_per_what_runs_it_not_where_it_lies() {
+        let base = scratch("tool");
+        let pkg = base.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("build.rs"), "fn main() {}").unwrap();
+        let pkg = crate::vfs::normalize_path(&pkg.to_string_lossy());
+        let (a, b) = (std::path::PathBuf::from("/opt/a/makepad"), std::path::PathBuf::from("/opt/b/makepad"));
+        let env_key = |tool: u128, exe: &std::path::Path, rustc: &std::path::Path| {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.env("OUT_DIR", base.join("somewhere")).env("TARGET", "x86_64-unknown-linux-gnu").env("RUSTC", rustc).env("CARGO", exe);
+            script_env_key(7, tool, cmd.get_envs(), exe)
+        };
+        assert_eq!(env_key(1, &a, &a), env_key(1, &b, &b), "one identity at two paths: one key");
+        assert_ne!(env_key(1, &a, &a), env_key(2, &a, &a), "another identity: another key");
+        let other = env_key(1, &a, std::path::Path::new("/usr/bin/rustc"));
+        assert!(other.contains("\nRUSTC=/usr/bin/rustc") && !other.contains("CARGO=") && !env_key(1, &a, &a).contains("OUT_DIR"), "{other}");
+
+        // where each identity's output is: written once by its first run, standing on every switch after
+        let build = base.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let base_dir = format!("{}/s-0123456789abcdef", crate::vfs::normalize_path(&build.to_string_lossy()));
+        let output = "cargo:rerun-if-changed=build.rs\ncargo:rustc-cfg=x\n";
+        let runs = std::cell::Cell::new(0);
+        let start = |tool: u128, exe: &std::path::Path| {
+            let key = env_key(tool, exe, exe);
+            let stands = |at: &str| match (std::fs::read_to_string(format!("{at}/output")), std::fs::read_to_string(format!("{at}/relax-rerun"))) {
+                (Ok(old), Ok(k)) if rerun_key(&old, &pkg, &key, None, None).as_deref() == Some(k.as_str()) => Ok(old),
+                _ => Err("does not stand".to_string()),
+            };
+            let key_of = |declared: &str| rerun_key(declared, &pkg, &key, None, None).unwrap();
+            let (at, standing) = script_build_dir(&base_dir, &declared_inputs(output), &key_of, &stands);
+            if standing.is_err() {
+                runs.set(runs.get() + 1);
+                std::fs::create_dir_all(&at).unwrap();
+                std::fs::write(format!("{at}/output"), output).unwrap();
+                std::fs::write(format!("{at}/relax-rerun"), rerun_key(output, &pkg, &key, None, None).unwrap()).unwrap();
+            }
+            at
+        };
+        let first = start(1, &a);
+        assert_eq!((start(1, &b), runs.get()), (first.clone(), 1), "the other copy finds the first one's output");
+        let second = start(2, &b);
+        assert_ne!(second, first);
+        for _ in 0..2 {
+            assert_eq!((start(1, &a), start(2, &b)), (first.clone(), second.clone()));
+        }
+        assert_eq!(runs.get(), 2, "each identity ran the script once, whatever the switches");
+
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let out = out.to_string_lossy().into_owned();
+        assert!(!names_program(output, &out, &a));
+        assert!(names_program("cargo:rustc-env=TOOL=/opt/a/makepad\n", &out, &a), "stdout naming the program");
+        std::fs::write(format!("{out}/built.rs"), "pub const RUSTC: &str = \"/opt/a/makepad\";").unwrap();
+        assert!(names_program(output, &out, &a) && !names_program(output, &out, &b), "a file in OUT_DIR naming it");
+        let per_program = rerun_key(&keyed_output(output, false, true), &pkg, "env", None, None).unwrap();
+        assert!(per_program.contains("\nx ") && declared_inputs(&keyed_output(output, false, true)).contains(PROGRAM_LINE), "its key and name hold the path: {per_program}");
         std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// `build/` keeps what the roots name: a pass names each build dir in its root before it uses
-    /// it and leaves the root naming exactly what it took; the prune removes what no root names and
-    /// no run holds, the root of a checkout that is gone with what only it named, and keeps a base
-    /// dir while one of its outputs stays; it does nothing while another holds the build lock. A
+    /// it and leaves the root naming exactly what it took (and fresh, once it is old); the prune
+    /// removes what no root names and no run holds, the root of a checkout that is gone and one no
+    /// pass refreshed for ROOT_UNUSED, each with what only it named, and keeps a base dir while one
+    /// of its outputs stays; it does nothing while another holds the build lock. A
     /// held dir made again is locked again (the test run twice in one process failed on that).
     #[test]
     fn the_build_prune_keeps_what_the_roots_name() {
@@ -2857,28 +3009,40 @@ mod shared_script_tests {
         assert_eq!(root_text(), format!("{ck}\nheld-0123456789abcdef\nagain-0123456789abcdef\n"));
         two.finish();
         assert_eq!(root_text(), format!("{ck}\nagain-0123456789abcdef\n"), "the pass's root names what it took");
+        // a pass that leaves its root as it was refreshes it once it is old (ROOT_REFRESH)
+        let three = BuildRoot::at(build.clone(), ck.clone(), &["run"]);
+        three.take("again-0123456789abcdef");
+        let age = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap().elapsed().unwrap_or_default();
+        let set_age = |p: &std::path::Path, days: u64| std::fs::File::options().write(true).open(p).unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 3600)).unwrap();
+        set_age(&three.path, 2);
+        three.finish();
+        assert!(age(&three.path) < std::time::Duration::from_secs(3600), "refreshed");
 
-        for n in ["named-0123456789abcdef", "s-0123456789abcdef", "s-0123456789abcdef-00000000000000aa", "t-0123456789abcdef", "unnamed-0123456789abcdef", "gone-0123456789abcdef"] {
+        for n in ["named-0123456789abcdef", "s-0123456789abcdef", "s-0123456789abcdef-00000000000000aa", "t-0123456789abcdef", "unnamed-0123456789abcdef", "gone-0123456789abcdef", "aged-0123456789abcdef"] {
             std::fs::create_dir_all(build.join(n).join("out")).unwrap();
         }
         let roots = build.join("roots");
         std::fs::write(roots.join("other"), format!("{ck}\nnamed-0123456789abcdef\ns-0123456789abcdef-00000000000000aa\n")).unwrap();
         std::fs::write(roots.join("gone"), format!("{}\ngone-0123456789abcdef\n", base.join("deleted").display())).unwrap();
         std::fs::write(roots.join(".writing.1"), "").unwrap();
+        // the root of a Relax no longer run here: no pass refreshed it for ROOT_UNUSED
+        std::fs::write(roots.join("aged"), format!("{ck}\naged-0123456789abcdef\n")).unwrap();
+        set_age(&roots.join("aged"), 8);
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
         {
             let _other = build_lock(&build, true).unwrap();
             assert_eq!(prune_build(&build, later, false), 0, "the build lock is another's");
         }
         assert_eq!(prune_build(&build, std::time::UNIX_EPOCH, true), 0, "what changed since `since` stays");
-        assert_eq!(prune_build(&build, later, true), 3);
+        assert_eq!(prune_build(&build, later, true), 4);
         let mut left: Vec<String> = std::fs::read_dir(&build).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         left.sort();
         assert_eq!(left, ["again-0123456789abcdef", "held-0123456789abcdef", "lock", "named-0123456789abcdef", "roots", "s-0123456789abcdef", "s-0123456789abcdef-00000000000000aa"],
             "named, held by this run (its use lock), and a base dir with an output; no trash");
         let mut roots_left: Vec<String> = std::fs::read_dir(&roots).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         roots_left.retain(|n| n.len() != 32);
-        assert_eq!(roots_left, ["other"], "a gone checkout's root and a stale root write go");
+        assert_eq!(roots_left, ["other"], "a gone checkout's root, an unused one and a stale root write go");
         // a held dir removed outside the prune and made again (this test run again in one process,
         // which makes its scratch folder anew): the next take use-locks the new one
         let held = build.join("held-0123456789abcdef");
