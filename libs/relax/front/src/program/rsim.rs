@@ -250,6 +250,7 @@ impl Program {
         };
         self.sim_macros = Some(macros);
         super::resume_import_uses(prev);
+        self.sim_own = own.to_vec();
         self.sim_ambiguity = Some(amb);
         self.sim_diags = Some(out);
         self.glob_amb_cache.clear();

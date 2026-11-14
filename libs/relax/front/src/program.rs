@@ -618,6 +618,10 @@ pub struct Program {
     /// use finds (bits 0-1) and for the module's glob declaration (bits 2-3); bit 4: the module
     /// binds the name itself (rsim.rs `ambiguity_table`)
     pub sim_ambiguity: Option<HashMap<(u32, Sym, bool), u8>>,
+    /// the crates the import replay covered (`run_import_sim`'s own): `sim_ambiguity` answers for
+    /// their modules; every other module's ambiguities are read from its globs (privacy.rs
+    /// `glob_ambiguity_in`), as rustc reads a finished crate's from its metadata
+    pub sim_own: Vec<bool>,
     /// what the replay reported, until the check emits it
     pub sim_diags: Option<Vec<SimDiag>>,
     /// the import replay's macro namespace of the checked modules (rsim.rs `macro_table`)
@@ -971,6 +975,7 @@ impl Program {
             glob_prec_cache: Default::default(),
             own_crates: Vec::new(),
             sim_ambiguity: None,
+            sim_own: Vec::new(),
             sim_diags: None,
             sim_macros: None,
             scope_cache: crate::conc::MemoMap::with_bits(NAME_MEMO_BITS),

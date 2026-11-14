@@ -243,6 +243,28 @@ fn a_dependency_body_edit_checks_only_that_dependency() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The import replay covers the crates checked again; a crate whose verdict is reused is read as a
+/// finished one, as rustc reads a dependency's names from its metadata (run.rs). The binary's
+/// imports through the library, a single import and a glob of a module whose two globs bring
+/// different `Dup`s, resolve as a replay of every crate resolves them when only the binary is
+/// checked again, and its uses of `Dup` stay ambiguous.
+#[test]
+fn a_reused_crate_is_read_as_a_finished_one_by_the_import_replay() {
+    if std::env::var_os(CHILD).is_some() { return; }
+    let lib = "pub mod inner { mod a { pub struct Dup; } mod b { pub struct Dup; } pub use a::*; pub use b::*; }\n\
+        pub use inner::*;\npub fn f() -> u32 { 1 }\n";
+    let bin = "#![warn(ambiguous_glob_imports)]\nuse pkg::inner::Dup as Single;\nuse pkg::inner::*;\n\
+        fn main() { let _ = pkg::Dup; let _ = Single; let _ = Dup; let _ = pkg::f(); }\n";
+    let dir = package("finished", &[("lib.rs", lib), ("bin.rs", bin)]);
+    let first = check_in_child(&dir, true, &[]);
+    let ambiguous = |r: &Run| r.diags.iter().filter(|d| d.contains("`Dup` is ambiguous")).count();
+    assert!(first.code == 0 && ambiguous(&first) >= 2, "the imports and the uses are the lint: {first:?}");
+    std::fs::write(dir.join("bin.rs"), bin.replace("let _ = pkg::f();", "let _ = pkg::f() + 1;")).unwrap();
+    let (reused, _) = reused_and_verified(&dir, &[], "the binary edited");
+    assert_eq!((reused.hits, ambiguous(&reused)), (1, ambiguous(&first)), "only the binary checked again, its reports as before: {reused:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A public item added to the library, by a name nothing above it can have seen (no glob brings
 /// the library's names, no module it sees through globs binds the name): only the library is
 /// checked again.

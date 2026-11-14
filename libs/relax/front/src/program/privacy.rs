@@ -121,9 +121,9 @@ impl Program {
     /// resolution has a use of the name find, a name the module binds itself included (a single
     /// import of an ambiguous name); `skip_direct`: its glob declaration's.
     pub fn glob_ambiguity(&self, m: u32, name: Sym, ns_type: bool, _from: u32, skip_direct: bool) -> u8 {
-        // a checked module: what the replay of rustc's import resolution found
+        // a module of a crate the replay of rustc's import resolution covered: what it found
         if let Some(t) = &self.sim_ambiguity {
-            if self.own_crates.get(self.mods[m as usize].krate as usize).copied().unwrap_or(false) {
+            if self.sim_own.get(self.mods[m as usize].krate as usize).copied().unwrap_or(false) {
                 let md = &self.mods[m as usize];
                 let v = t.get(&(m, name, ns_type)).copied().unwrap_or(0);
                 if skip_direct { return (v >> 2) & 3; }
@@ -206,7 +206,7 @@ impl Program {
             let md = &self.mods[m as usize];
             let direct = !skip_direct && if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) };
             // (a direct binding of a checked module can still lead to an ambiguous one: a single import)
-            if direct && !(self.sim_ambiguity.is_some() && self.own_crates.get(md.krate as usize).copied().unwrap_or(false)) {
+            if direct && !(self.sim_ambiguity.is_some() && self.sim_own.get(md.krate as usize).copied().unwrap_or(false)) {
                 return None;
             }
             let ambig = self.glob_ambiguity(m, name, ns_type, from, skip_direct);
@@ -217,7 +217,7 @@ impl Program {
             if direct { return None; }
             // the first scope that binds the name settles it (late resolution reports no ambiguity
             // between a scope's glob and an outer scope)
-            if self.sim_ambiguity.as_ref().is_some_and(|t| self.own_crates.get(md.krate as usize).copied().unwrap_or(false) && t.contains_key(&(m, name, ns_type))) {
+            if self.sim_ambiguity.as_ref().is_some_and(|t| self.sim_own.get(md.krate as usize).copied().unwrap_or(false) && t.contains_key(&(m, name, ns_type))) {
                 return None;
             }
             match md.lexical_parent {

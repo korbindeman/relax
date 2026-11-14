@@ -1987,14 +1987,18 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if check {
         let mut own = vec![false; prog.crates.len()];
         for &k in &checked { prog.crates[k as usize].validate = true; own[k as usize] = true; }
-        // rustc's import resolution replayed over the checked crates: the glob ambiguities it finds
-        // answer the name lookups of the declarations collected next
+        // rustc's import resolution replayed over the checked crates whose verdicts are not reused:
+        // the glob ambiguities it finds answer the name lookups of the declarations collected next.
+        // A crate whose verdict is reused is a finished crate, read as rustc reads one from its
+        // metadata (rsim.rs ExtTable, privacy.rs glob_ambiguity_in): a crate's import resolution
+        // rests only on its dependencies' bindings, so the replay of the others is the same
         prog.own_crates = own.clone();
         relax_types::lint::enable();
         let t = Instant::now();
-        prog.run_import_sim(&own);
+        let replay: Vec<bool> = (0..own.len()).map(|k| own[k] && !reuse.as_ref().is_some_and(|r| r.is_hit(k as u32))).collect();
+        prog.run_import_sim(&replay);
         if std::env::var_os("RELAX_CHECK_TIMES").is_some() {
-            eprintln!("relax check: import resolution replayed over {} crates in {:.1} ms", checked.len(), t.elapsed().as_secs_f64() * 1e3);
+            eprintln!("relax check: import resolution replayed over {} of {} crates in {:.1} ms", replay.iter().filter(|x| **x).count(), checked.len(), t.elapsed().as_secs_f64() * 1e3);
         }
     }
     // `makepad test`: the crates under test are checked as `cargo test` compiles them before any
