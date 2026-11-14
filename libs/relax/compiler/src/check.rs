@@ -1341,6 +1341,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         if !out.errors.is_empty() { out.needs_load = true; }
         out
     };
+    // the cache files' pages the load touched (the front's arrays: sources, tokens, the ASTs of
+    // every crate) leave the check's resident set: they are read-only file pages, and the ones a
+    // body reads again come back from the page cache (a minor fault)
+    crate::pack::release_resident();
     relax_types::body_facts::begin(&fresh);
     relax_types::body_facts::open();
     for (d, f) in replay { relax_types::body_facts::replay(&u.prog, d, f); }
@@ -1358,8 +1362,9 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((owner, generic)) = fns.get(i) else { break };
                         local.push((i, check_one(owner, *generic, true)));
-                        // return the allocator's free pages as the check goes (a large app held 4.6 GB)
-                        if i % 20_000 == 19_999 { crate::memstat::trim(); }
+                        // return the allocator's free pages as the check goes (a large app held 4.6 GB),
+                        // and the cache mappings' resident pages (pack::release_resident)
+                        if i % 20_000 == 19_999 { crate::memstat::trim(); crate::pack::release_resident(); }
                     }
                     results.lock().unwrap().extend(local);
                 }).expect("check worker");
