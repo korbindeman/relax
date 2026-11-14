@@ -637,8 +637,9 @@ pub static TO_REMOVE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// `check_only` (`relax check`): a script that compiles C is not run without `--allow-c` (rustc's
 /// check never links native code): its crate gets an empty answer (OUT_DIR, no cfgs), said once,
-/// and so does a script that reads such a script's `DEP_` metadata. Any other script that fails
-/// fails the check, as under `cargo check`.
+/// and so does a script that can run C (its build-dependencies reach a native package) and one
+/// that reads such a script's `DEP_` metadata. Any other script that fails fails the check, as
+/// under `cargo check`.
 pub type ScriptsDone<'a> = dyn Fn(&Graph, &[usize], &[Vec<String>], &[Vec<(String, String)>]) -> Option<Box<dyn std::any::Any>> + Sync + 'a;
 
 /// `scripts_done`: called once the scripts Relax runs have finished while cargo is still building
@@ -710,7 +711,9 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         _ => None,
     };
     let mut native_seeds: Vec<usize> = Vec::new();
-    let mut check_skipped: Vec<usize> = Vec::new();
+    // the scripts not run for want of `--allow-c`, with what their crates' dependents' scripts are
+    // told (C_NOT_RUN, C_CALL_NOT_RUN)
+    let mut check_skipped: Vec<(usize, &'static str)> = Vec::new();
     for (i, reason) in native_scripts {
         let bs = &g.build_scripts[i];
         let (_, pname, _) = &g.pkg[bs.krate];
@@ -726,7 +729,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         // alone run under Relax as before
         if reason.compiles_c() && check_only {
             eprintln!("relax check: `{}`'s build script compiles C ({}): not run without `--allow-c` (its cfgs and OUT_DIR are missing; a `--allow-c` run fills the cache this check reads)", pname, why);
-            check_skipped.push(bs.krate);
+            check_skipped.push((bs.krate, C_NOT_RUN));
             continue;
         }
         if reason.compiles_c() {
@@ -737,9 +740,26 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
     // The scripts Relax runs whose build-dependencies reach a native package: their child runs
     // compile it, so they read the native outputs from a receipt (native.rs `write_receipt`).
     // Only they wait for a cold native build and only their rerun keys hold the receipt's name.
-    let reach: Vec<bool> = g.build_scripts.iter().map(|bs| {
-        !native_krates.is_empty() && !native_krates.contains(&bs.krate) && !check_skipped.contains(&bs.krate) && reaches_native(g, bs, &native_krates)
+    let mut reach: Vec<bool> = g.build_scripts.iter().map(|bs| {
+        !native_krates.is_empty() && !native_krates.contains(&bs.krate) && !check_skipped.iter().any(|s| s.0 == bs.krate) && reaches_native(g, bs, &native_krates).is_some()
     }).collect();
+    // Such a script can run C (call into the native library, run a program the native build made),
+    // and without `--allow-c` no C runs: nothing external does unless the flag grants it. A check
+    // reads the native packages' cached outputs and runs none of their code; the script is not
+    // run, as a C compile is not, with a line that names the grant (11-14: its child ran without
+    // the native library, and its first call into it reported a fn "not available on this host").
+    if !sess.options.allow_c {
+        for (i, bs) in g.build_scripts.iter().enumerate() {
+            if !std::mem::take(&mut reach[i]) {
+                continue;
+            }
+            let pname = &g.pkg[bs.krate].1;
+            let via = reaches_native(g, bs, &native_krates).unwrap_or_default();
+            let cmd = if check_only { "check" } else { "run" };
+            eprintln!("relax {cmd}: `{pname}`'s build script can run C (it build-depends on `{via}`, whose build script compiles C): not run without `--allow-c`, the grant to run C (its OUT_DIR is missing; `makepad {cmd} --allow-c` runs it with the native build)");
+            check_skipped.push((bs.krate, C_CALL_NOT_RUN));
+        }
+    }
     let mut receipt: Option<String> = None;
     let mut prebuilt = false;
     if reach.contains(&true) {
@@ -870,9 +890,9 @@ fn apply_built(g: &mut Graph, native_krates: &[usize], built: crate::native::Bui
     Ok(())
 }
 
-/// Whether `bs`'s build-dependencies reach one of the native packages (`native_krates`): its
-/// child run compiles that package (a build-dependency is the same package built for the host).
-fn reaches_native(g: &Graph, bs: &BuildScript, native_krates: &[usize]) -> bool {
+/// The first of the native packages (`native_krates`) `bs`'s build-dependencies reach, by name:
+/// its child run compiles that package (a build-dependency is the same package built for the host).
+fn reaches_native<'g>(g: &'g Graph, bs: &BuildScript, native_krates: &[usize]) -> Option<&'g str> {
     let native: Vec<(&str, &str)> = native_krates.iter().map(|&k| (g.pkg[k].1.as_str(), g.pkg[k].2.as_str())).collect();
     let mut seen = vec![false; g.raw.len()];
     let mut stack: Vec<usize> = bs.build_deps.iter().map(|d| d.0).collect();
@@ -882,11 +902,11 @@ fn reaches_native(g: &Graph, bs: &BuildScript, native_krates: &[usize]) -> bool 
         }
         let u = &g.raw[i];
         if native.contains(&(u.pkg.1.as_str(), u.pkg.2.as_str())) {
-            return true;
+            return Some(u.pkg.1.as_str());
         }
         stack.extend(u.deps.iter().map(|d| d.0));
     }
-    false
+    None
 }
 
 /// The native outputs a child run's receipt names, onto this graph's native scripts by their
@@ -945,9 +965,10 @@ fn apply_native_scripts(g: &mut Graph, scripts: Vec<crate::native::ScriptOut>) {
 /// What each script handed on to the scripts of its dependents, by script index: the metadata
 /// its output carried (`script_metadata`), or why it has none (its script was not run, or failed).
 /// The metadata a check without `--allow-c` hands on for a script it did not run for its C compile
-/// (C_NOT_RUN), or for that script's `DEP_` metadata (C_DEP_NOT_RUN): a script that reads it is not
-/// run either, and is no failure of the check.
+/// (C_NOT_RUN), for the C it can run (C_CALL_NOT_RUN), or for such a script's `DEP_` metadata
+/// (C_DEP_NOT_RUN): a script that reads it is not run either, and is no failure of the check.
 const C_NOT_RUN: &str = "its build script compiles C, which is not run without `--allow-c`";
+const C_CALL_NOT_RUN: &str = "its build script can run C (a build-dependency of it compiles C), which is not run without `--allow-c`";
 const C_DEP_NOT_RUN: &str = "its build script was not run, for a C build script's metadata it reads";
 
 /// One table for both calls of `relax_scripts` (the macro world's scripts first).
@@ -957,7 +978,7 @@ type LinksMeta = Mutex<std::collections::HashMap<usize, Result<Vec<(String, Stri
 /// ones), on the pool: (crates, stdout or error, OUT_DIR, confined) per script. A script whose package
 /// depends on `links` packages runs after their scripts, given their metadata (cargo orders the
 /// runs the same way); most graphs have no such pair and run every script at once.
-fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, root: &BuildRoot, native_krates: &[usize], check_skipped: &[usize],
+fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &str, root: &BuildRoot, native_krates: &[usize], check_skipped: &[(usize, &'static str)],
     receipts: &[Option<&str>], meta: &LinksMeta,
     only: &(dyn Fn(usize) -> bool + Sync)) -> Vec<ScriptRun> {
     let results: Mutex<Vec<ScriptRun>> = Mutex::new(Vec::new());
@@ -979,10 +1000,10 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
         if native_krates.contains(&bs.krate) || !only(bs.krate) {
             continue;
         }
-        if check_skipped.contains(&bs.krate) {
+        if let Some(&(_, why)) = check_skipped.iter().find(|s| s.0 == bs.krate) {
             let out_dir = unbuilt(bs);
             results.lock().unwrap().push((bs.krates(), Ok(String::new()), out_dir, false));
-            meta.lock().unwrap().insert(i, Err(C_NOT_RUN.to_string()));
+            meta.lock().unwrap().insert(i, Err(why.to_string()));
             continue;
         }
         let (dir, pname, ver) = &g.pkg[bs.krate];
@@ -1100,8 +1121,8 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
 /// metadata the scripts of its package's `links` dependencies printed. Err: such a script handed
 /// nothing on (not run, or failed) and this script reads `DEP_` variables, so it is not run: it
 /// would fail on the missing value, or answer other than under cargo; with true when it is missing
-/// for a check's C skip (C_NOT_RUN, C_DEP_NOT_RUN). A dependency built by cargo (`--allow-c`) is
-/// not in the table: a script reading its metadata is cargo's too.
+/// for a check's C skip (C_NOT_RUN, C_CALL_NOT_RUN, C_DEP_NOT_RUN). A dependency built by cargo
+/// (`--allow-c`) is not in the table: a script reading its metadata is cargo's too.
 fn links_env(g: &Graph, bs: &BuildScript, meta: &LinksMeta) -> Result<Vec<(String, String)>, (String, bool)> {
     let mut env = Vec::new();
     for &d in &bs.links_deps {
@@ -1115,7 +1136,7 @@ fn links_env(g: &Graph, bs: &BuildScript, meta: &LinksMeta) -> Result<Vec<(Strin
             }
             Some(Err(why)) if crate::native::reads_dep_metadata(bs) => {
                 return Err((format!("{}: the build script of `{}` was not run: it reads the `DEP_` metadata of `{}` (links = \"{}\"), and {}",
-                    bs.src_path, g.pkg[bs.krate].1, dname, links, why), why == C_NOT_RUN || why == C_DEP_NOT_RUN));
+                    bs.src_path, g.pkg[bs.krate].1, dname, links, why), [C_NOT_RUN, C_CALL_NOT_RUN, C_DEP_NOT_RUN].contains(&why.as_str())));
             }
             _ => {}
         }
