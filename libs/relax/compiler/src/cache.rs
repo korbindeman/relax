@@ -12098,6 +12098,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&DEFERRED_FRONT, relax_session::sync::Mutex::new(Vec::new()));
     reset(&THUNK_DECODED, std::sync::atomic::AtomicU64::new(0));
     reset(&THUNK_DECODE_NS, std::sync::atomic::AtomicU64::new(0));
+    // the next run's entry sets it again (run.rs cmd_run_inner); the stores this one found stale
+    // go with it
+    reset(&SHARED_CODE, relax_session::sync::Mutex::new(None));
 }
 
 /// The mappings of the stores: last of what a run held, since what the run's tables are views of
