@@ -106,9 +106,15 @@ pub(crate) fn sandbox_check(prog: &crate::program::Program, tcx: &crate::tcx::Tc
     let files: std::collections::BTreeSet<u32> = prog.mods.iter().filter(|m| m.krate == krate).map(|m| m.file).collect();
     for &f in &files {
         let pf = &prog.files[f as usize];
+        // every fn body, those the load skipped too: a `makepad run` parses a body a later parse
+        // can do alone on its first need, into the part that continues the file's tree. All of
+        // them are parsed here, before any of the module's code can run, and read with the tree.
+        let _ = pf.part(&prog.crates[krate as usize].cfg);
         let ast = &pf.ast;
-        let tok = |i: u32| -> &[u8] { pf.toks.get(i as usize).map_or(&[][..], |t| &pf.src[t.lo as usize..t.hi as usize]) };
-        for it in &ast.items {
+        let trees: Vec<&crate::ast::Ast> = std::iter::successors(Some(ast), |t| t.part.get().map(|p| &**p)).collect();
+        // (the accessors of `ast` read the part's ids too)
+        let tok = |i: u32| -> &[u8] { let t = pf.tok(i); pf.bytes(t.lo, t.hi) };
+        for it in trees.iter().flat_map(|t| &t.items) {
             for a in ast.list(it.attrs) {
                 if a.toks.hi > a.toks.lo {
                     let n = tok(a.toks.lo);
@@ -132,25 +138,24 @@ pub(crate) fn sandbox_check(prog: &crate::program::Program, tcx: &crate::tcx::Tc
                 out.push(format!("{}: {} is not allowed in a sandboxed module -- use safe code and the host's API", at(f, it.lo), b));
             }
         }
-        for e in &ast.exprs {
+        for e in trees.iter().flat_map(|t| &t.exprs) {
             match &e.kind {
                 ExprKind::Unsafe(_) => out.push(format!("{}: `unsafe` is not allowed in a sandboxed module -- use safe code and the host's API", at(f, e.lo))),
-                ExprKind::Mac(m) if ast.row(*m).args != crate::ast::NO_MAC_ARGS && ast.mac_args.get(ast.row(*m).args as usize).map_or(false, |a| a.asm.is_some()) => {
+                ExprKind::Mac(m) if ast.row(*m).args != crate::ast::NO_MAC_ARGS && ast.mac_arg(ast.row(*m).args).asm.is_some() => {
                     out.push(format!("{}: `asm!` is not allowed in a sandboxed module", at(f, e.lo)))
                 }
                 _ => {}
             }
         }
-        for t in &ast.tys {
-            if let Ty::Ptr(..) = t {
-                out.push(format!("{}: raw pointers are not allowed in a sandboxed module -- use references", at(f, 0)));
-                break;
-            }
+        if trees.iter().flat_map(|t| &t.tys).any(|t| matches!(t, Ty::Ptr(..))) {
+            out.push(format!("{}: raw pointers are not allowed in a sandboxed module -- use references", at(f, 0)));
         }
-        // built-in macros that read the host's files or environment (expanded before the tree)
-        for (i, t) in pf.toks.iter().enumerate() {
-            let w = &pf.src[t.lo as usize..t.hi as usize];
-            if matches!(w, b"include_bytes" | b"include_str" | b"include" | b"env" | b"option_env" | b"asm" | b"global_asm") && tok(i as u32 + 1) == b"!" {
+        // built-in macros that read the host's files or environment (expanded before the tree):
+        // the file's tokens with its expansions, then those of its lazily parsed bodies
+        let part_toks = pf.parts().flat_map(|p| p.toks.iter().enumerate().map(move |(j, t)| (p.tok_base + j as u32, t)));
+        for (i, t) in pf.toks.iter().enumerate().map(|(i, t)| (i as u32, t)).chain(part_toks) {
+            let w = pf.bytes(t.lo, t.hi);
+            if matches!(w, b"include_bytes" | b"include_str" | b"include" | b"env" | b"option_env" | b"asm" | b"global_asm") && tok(i + 1) == b"!" {
                 out.push(format!("{}: `{}!` is not allowed in a sandboxed module", at(f, t.lo), String::from_utf8_lossy(w)));
             }
         }
