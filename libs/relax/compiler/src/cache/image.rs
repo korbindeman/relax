@@ -169,10 +169,16 @@ impl Cache {
         }
         crate::run::yield_section("image encode");
         let mut e = E::default();
-        // its whole size at once: growing it past the tables to the code copied below moved tens of
-        // MB in one step between two yield checks
-        e.0.reserve(slots.0.len() + blob.len() + tab.keys.list.iter().chain(&tab.syms.list).chain(&tab.files.list).map(|b| b.len() + 4).sum::<usize>()
-            + data.objs.iter().map(|r| 48 + r.bytes.len() + r.name.as_ref().map_or(0, |n| n.len()) + r.rel.len() * 17).sum::<usize>() + key_crates.len() * 8 + (64 << 10));
+        // its whole size at once, exactly (each part as it is written below): growing it past the
+        // tables to the code copied last moved tens of MB in one step between two yield checks
+        let size = 4 + tab.crates.len() * 32
+            + [&tab.keys, &tab.syms, &tab.files].iter().map(|t| 4 + t.list.iter().map(|b| 4 + b.len()).sum::<usize>()).sum::<usize>()
+            + 4 + tab.keys.list.len() * 4
+            + 4 + thunk_keys.len() * 4
+            + key_crates.iter().map(|kc| 4 + kc.as_ref().map_or(0, |cs| cs.len() * 4)).sum::<usize>()
+            + data.encoded_len()
+            + 4 + slots.0.len() + 4 + blob.len();
+        e.0.reserve_exact(size);
         e.u32(tab.crates.len() as u32);
         for &c in &tab.crates {
             e.u128(self.crate_ident[c as usize]);
@@ -235,7 +241,6 @@ impl Cache {
         if data.encode(&mut e, stop).is_none() { return Err(()); }
         ph[3] = t0.elapsed().as_secs_f64() * 1e3;
         crate::run::yield_section("image copy");
-        e.0.reserve(slots.0.len() + blob.len() + 8);
         e.u32(n);
         for part in slots.0.chunks(1 << 20) {
             e.0.extend_from_slice(part);
@@ -247,7 +252,7 @@ impl Cache {
             if stop() { return Err(()); }
         }
         if self.verbose {
-            eprintln!("relax cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code); ms: slots to {:.1}, data to {:.1}, key crates to {:.1}, encoded {:.1}", n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024, ph[0], ph[1], ph[2], ph[3]);
+            eprintln!("relax cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code); ms: slots to {:.1}, data to {:.1}, key crates to {:.1}, encoded {:.1}; {} bytes written, {} reserved, capacity {}", n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024, ph[0], ph[1], ph[2], ph[3], e.0.len(), size, e.0.capacity());
         }
         Ok(Some((e.0, n)))
     }
@@ -601,6 +606,13 @@ impl ImageData {
                 return;
             }
         }
+    }
+
+    /// The bytes `encode` writes.
+    fn encoded_len(&self) -> usize {
+        let objs = self.objs.iter().map(|r| 17 + if r.ok { 8 + 1 + r.name.as_ref().map_or(0, |n| 4 + n.len()) + 4 + r.bytes.len() + 4 + r.rel.len() * 17 } else { 0 }).sum::<usize>();
+        let ok = |list: &[(u32, u32)]| 4 + 8 * list.iter().filter(|&&(_, o)| self.objs[o as usize].ok).count();
+        4 + objs + ok(&self.sym) + ok(&self.statics)
     }
 
     /// None: `stop` said yes (asked every 256 objects)
