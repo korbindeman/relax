@@ -71,6 +71,10 @@ struct Dep {
     platform: Option<String>,
     /// a path package directory, or None for a registry or git package
     path: Option<String>,
+    /// `path` is the manifest's own `path` key (not the root workspace's [patch] or
+    /// [workspace.dependencies]): what a third-party manifest names is no path package of the
+    /// person's (`Graph::follow`)
+    own_path: bool,
     /// a git package's source
     git: Option<GitSrc>,
     /// the version requirement (`version = ..`; "*" when none)
@@ -914,6 +918,7 @@ impl Resolver {
                 let package = s(&st, "package").unwrap_or_else(|| key.clone());
                 let mut git = git_src(&st, &format!("{}/Cargo.toml", dir), key)?;
                 let mut path = s(&st, "path").map(|p| join(&base_dir, &p));
+                let own_path = path.is_some() && !from_ws;
                 // the root workspace's [patch] of the dependency's source (crates-io or its repository)
                 if path.is_none() && (git.is_some() || !st.contains_key("registry")) {
                     let src = git.as_ref().map_or_else(|| "crates-io".to_string(), |g| canonical_url(&g.url));
@@ -935,6 +940,7 @@ impl Resolver {
                     default_features: b(&st, "default-features").or_else(|| b(&st, "default_features")).unwrap_or(true),
                     features: strs(&st, "features"),
                     platform: platform.clone(),
+                    own_path,
                     path,
                     git,
                     req: s(&st, "version").unwrap_or_else(|| "*".to_string()),
@@ -2234,7 +2240,22 @@ impl<'a> Feat<'a> {
                 return Err(format!("registry package `{}` {} compiles C or C++ (build-dependency `{}`): it {}", m.name, m.version, c, relax_session::options::C_GATE));
             }
         }
-        let (dir, source) = self.r.dep_dir(d)?;
+        let (dir, mut source) = self.r.dep_dir(d)?;
+        // a path dependency a third-party manifest names is third-party too: a registry package's
+        // in its vendored folder is a registry package (its build script and macros confined as
+        // its owner's are); one anywhere else, or a git package's outside its repository (a mount
+        // keeps the ones inside git: dep_dir), would make a folder of this machine the person's
+        // own package, unconfined, so it is an error
+        let owner = &self.r.manifests[k.0];
+        if d.own_path && source == Source::Path && owner.source != Source::Path {
+            let vendored = matches!(&self.r.vendor, Some((Vendor::Dir(v), _)) if dir.starts_with(&format!("{}/", v)));
+            if owner.source != Source::Registry || !vendored {
+                return Err(format!("{} package `{}` {} names the path dependency `{}` ({}), outside its {}: a third-party package's path dependency is never a package of the person's",
+                    if owner.source == Source::Registry { "registry" } else { "git" }, owner.name, owner.version, d.key, dir,
+                    if owner.source == Source::Registry { "vendored folder" } else { "repository" }));
+            }
+            source = Source::Registry;
+        }
         let t = self.r.load(&dir, source)?;
         if self.r.manifests[t].name != d.package {
             return Err(format!("{}/Cargo.toml: dependency `{}` names package `{}`, but {} holds `{}`", self.r.manifests[k.0].dir, d.key, d.package, dir, self.r.manifests[t].name));
@@ -3347,6 +3368,45 @@ required-features = ["b", "manual"]
         let _ = std::fs::write(format!("{root}/vendor/shares/Cargo.toml"), "[package]\nname = \"shares\"\nversion = \"6.0.1\"\nedition = \"2021\"\n[features]\ndefault = [\"nope/alloc\"]\n");
         let e = unit_graph(sess, &root, "app", &[]).err().unwrap();
         assert!(e.contains("names no dependency"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path dependency a third-party manifest names is third-party too. A vendored registry
+    /// package's, inside the vendored folder, is a registry package (its pkg_id is what makes a
+    /// unit third-party: its build script and macros run confined under `makepad run`); one
+    /// outside it is an error. It was a path package, the person's own: a vendored tree (the
+    /// repository's content) ran a build script of its choosing unconfined.
+    #[test]
+    fn a_third_party_manifests_path_dependency_is_no_path_package() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let vend = |dep: &str| format!("[package]\nname = \"vend\"\nversion = \"1.0.0\"\nedition = \"2021\"\n[dependencies]\n{dep}\n");
+        let pkg = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"1.0.0\"\nedition = \"2021\"\n");
+        let checksum = "{\"files\":{},\"package\":null}";
+        let (vend_inner, inner, outer) = (vend("inner = { path = \"../inner\" }"), pkg("inner"), pkg("outer"));
+        let root = tree("third-party-path", &[
+            ("Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n"),
+            (".cargo/config.toml", "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n"),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nvend = \"1\"\n"),
+            ("app/src/lib.rs", ""),
+            ("vendor/vend/Cargo.toml", vend_inner.as_str()),
+            ("vendor/vend/.cargo-checksum.json", checksum),
+            ("vendor/vend/src/lib.rs", ""),
+            ("vendor/inner/Cargo.toml", inner.as_str()),
+            ("vendor/inner/build.rs", "fn main() {}\n"),
+            ("vendor/inner/.cargo-checksum.json", checksum),
+            ("vendor/inner/src/lib.rs", ""),
+            ("outer/Cargo.toml", outer.as_str()),
+            ("outer/build.rs", "fn main() {}\n"),
+            ("outer/src/lib.rs", ""),
+        ]);
+        let g = unit_graph(sess, &root, "app", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let ids: Vec<&str> = g.units.iter().map(|u| u.pkg_id.as_str()).collect();
+        let inner: Vec<&&str> = ids.iter().filter(|id| id.contains("inner")).collect();
+        assert!(inner.len() >= 2 && inner.iter().all(|id| id.starts_with("registry+")), "the vendored path dependency, its lib and its build script, is a registry package: {ids:?}");
+        assert!(ids.iter().any(|id| id.starts_with("path+") && id.contains("/app#")), "the member stays the person's: {ids:?}");
+        let _ = std::fs::write(format!("{root}/vendor/vend/Cargo.toml"), vend("outer = { path = \"../../outer\" }"));
+        let e = unit_graph(sess, &root, "app", &[]).err().unwrap_or_else(|| panic!("a vendored package's path dependency outside the vendored folder resolved"));
+        assert!(e.contains("registry package `vend` 1.0.0 names the path dependency `outer`") && e.contains("outside its vendored folder"), "{e}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
