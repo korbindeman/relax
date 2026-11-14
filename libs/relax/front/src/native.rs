@@ -666,6 +666,10 @@ struct Outputs {
     /// the program's link arguments (`-C link-arg`s of its binary's rustc command: RUSTFLAGS, the
     /// cargo config's rustflags, its build scripts' `rustc-link-arg`s), as cargo gave them
     link_args: Vec<String>,
+    /// the linker of that same rustc command (`-C linker=`, from the cargo config's
+    /// `target.<triple>.linker` or CARGO_TARGET_<TRIPLE>_LINKER) when it is a C compiler driver:
+    /// `link_args` are written for it (a `-fuse-ld=<path>` that clang takes and gcc refuses)
+    linker: Option<String>,
 }
 
 /// (crate, features) of each build script of the graph: what the native steps read of it
@@ -746,10 +750,12 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
     let mut runs: Vec<(String, String)> = Vec::new();
     let mut env_seen: Vec<(String, Option<String>)> = Vec::new();
     let mut link_args: Vec<String> = Vec::new();
+    let mut linker: Option<String> = None;
     for line in messages.lines() {
         let j = crate::json::parse(line.as_bytes()).map_err(|e| format!("cargo message: {e}"))?;
         if let Some(a) = j.get("relax_link_args") {
             link_args = a.arr().iter().map(|x| x.str().to_string()).collect();
+            linker = j.get("relax_linker").map(|l| l.str().to_string()).filter(|l| !l.is_empty());
             continue;
         }
         let (n, v) = id_name_version(j.get("package_id").map(|p| p.str()).unwrap_or(""));
@@ -833,7 +839,7 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
             None => return Err(format!("--allow-c: a native build script links static library `{}`, but {} is in none of its search paths ({})", name, file, search.join(", "))),
         }
     }
-    Ok(Outputs { scripts, runs, env: env_seen, statics, archives, search, fw_search, dylibs, frameworks, link_args })
+    Ok(Outputs { scripts, runs, env: env_seen, statics, archives, search, fw_search, dylibs, frameworks, link_args, linker })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -970,7 +976,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let out = cmd.output();
-    let link_args = program_link_args(&link_dir, package, flags);
+    let (link_args, linker) = program_link(&link_dir, package, flags);
     let _ = std::fs::remove_dir_all(&link_dir);
     let out = out.map_err(|e| format!("--allow-c needs cargo on PATH to build the native dependencies ({}): {e}", package))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -1056,14 +1062,19 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
             return Err(format!("--allow-c: cargo and Relax resolve `{} {}` with different features (cargo {:?}, relax {:?})", p.1, p.2, built, ours));
         }
     }
-    keep.push_str(&format!("{{\"relax_link_args\":[{}]}}\n", link_args.iter().map(|a| json_string(a)).collect::<Vec<_>>().join(",")));
+    keep.push_str(&format!(
+        "{{\"relax_link_args\":[{}],\"relax_linker\":{}}}\n",
+        link_args.iter().map(|a| json_string(a)).collect::<Vec<_>>().join(","),
+        json_string(linker.as_deref().unwrap_or(""))
+    ));
     Ok(keep)
 }
 
-/// The link arguments the wrapper saw on the rustc command of the program (`wrapper`, a file per
-/// crate of the package's binaries and test harnesses): the binary `--bin` names, else the crate
-/// named after the package, else what they all say alike.
-fn program_link_args(dir: &std::path::Path, package: &str, flags: &[&String]) -> Vec<String> {
+/// The linker and link arguments the wrapper saw on the rustc command of the program (`wrapper`, a
+/// file per crate of the package's binaries and test harnesses: the linker on its first line,
+/// empty for none, then an argument a line): the binary `--bin` names, else the crate named after
+/// the package, else what they all say alike.
+fn program_link(dir: &std::path::Path, package: &str, flags: &[&String]) -> (Vec<String>, Option<String>) {
     let units: Vec<(String, String)> = std::fs::read_dir(dir).into_iter().flatten().flatten()
         .filter_map(|e| Some((e.file_name().to_str()?.to_string(), std::fs::read_to_string(e.path()).ok()?))).collect();
     let named = flags.iter().position(|f| f.as_str() == "--bin").and_then(|i| flags.get(i + 1)).map(|b| b.as_str())
@@ -1071,7 +1082,8 @@ fn program_link_args(dir: &std::path::Path, package: &str, flags: &[&String]) ->
         .unwrap_or(package).replace('-', "_");
     let alike = units.first().filter(|(_, t)| units.iter().all(|(_, u)| u == t));
     let text = units.iter().find(|(n, _)| *n == named).or(alike).map_or("", |(_, t)| t.as_str());
-    text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+    let (linker, args) = text.split_once('\n').unwrap_or((text, ""));
+    (args.lines().filter(|l| !l.is_empty()).map(str::to_string).collect(), Some(linker.to_string()).filter(|l| !l.is_empty()))
 }
 
 /// The `-C link-arg=` / `-C link-args=` values of a rustc command line, in order.
@@ -1096,6 +1108,42 @@ fn link_args_of(args: &[String]) -> Vec<String> {
         i += 1;
     }
     out
+}
+
+/// The `-C linker=` of a rustc command line (the last one), when rustc would drive it as a C
+/// compiler: no `-C linker-flavor=` other than gcc, and a name rustc does not take for a bare
+/// linker (`ld`, `ld.lld`, `x86_64-linux-gnu-ld`, `lld`, `rust-lld`, `wasm-ld`, `link`,
+/// `lld-link`; rustc_codegen_ssa's `infer_from`). Those take no C compiler's arguments, so the
+/// native library keeps `cc` for them.
+fn linker_of(args: &[String]) -> Option<String> {
+    let mut linker = None;
+    let mut flavor = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let value = if a == "-C" || a == "--codegen" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            a.strip_prefix("-C").or_else(|| a.strip_prefix("--codegen="))
+        };
+        if let Some(v) = value {
+            if let Some(x) = v.strip_prefix("linker=") {
+                linker = Some(x.to_string());
+            } else if let Some(x) = v.strip_prefix("linker-flavor=") {
+                flavor = Some(x.to_string());
+            }
+        }
+        i += 1;
+    }
+    if flavor.is_some_and(|f| f != "gcc") {
+        return None;
+    }
+    let linker = linker.filter(|l| !l.is_empty())?;
+    let stem = std::path::Path::new(&linker).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let bare = stem == "ld" || stem.starts_with("ld.") || stem.starts_with("ld64") || stem.ends_with("-ld")
+        || stem == "lld" || stem == "rust-lld" || stem == "wasm-ld" || stem == "link" || stem == "lld-link";
+    (!bare).then_some(linker)
 }
 
 /// `s` as a JSON string literal.
@@ -1324,7 +1372,9 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
     let symbols_path = format!("{}.symbols", tmp);
     // the accessors' object: the callback relink below reuses the link's arguments
     let addresses_path = format!("{}.addresses.o", tmp);
-    let mut cmd = Command::new(cc());
+    // the program's linker when its rustc command names one: `out.link_args` are written for it
+    let linker = out.linker.clone().unwrap_or_else(cc);
+    let mut cmd = Command::new(&linker);
     // every member of the archives, for the loader's check of which callbacks the program needs
     // (native_stub member_table): each global symbol they define is a root, so the link takes every
     // member that defines one; the program's imports are known when it loads
@@ -1447,7 +1497,7 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
     // that finds a library of the scripts' search folders at load time)
     cmd.args(&out.link_args);
     let run = |cmd: &mut Command| -> Result<(), String> {
-        let out = cmd.output().map_err(|e| format!("--allow-c: cannot run the C compiler to link the native library: {e}"))?;
+        let out = cmd.output().map_err(|e| format!("--allow-c: cannot run the linker to link the native library: {e}"))?;
         if out.status.success() {
             return Ok(());
         }
@@ -1471,7 +1521,7 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
             }
             let table = crate::native_stub::member_table(&members, &callbacks);
             std::fs::write(&stubs_path, crate::native_stub::object(triple, &callbacks, &table)?).map_err(|e| format!("{stubs_path}: {e}"))?;
-            let mut with_stubs = Command::new(cc());
+            let mut with_stubs = Command::new(&linker);
             with_stubs.arg(&stubs_path).args(cmd.get_args());
             run(&mut with_stubs)
         });
@@ -1678,14 +1728,15 @@ pub fn wrapper() -> Option<i32> {
         i += 1;
     }
     let types: Vec<String> = rest.iter().enumerate().filter_map(|(i, a)| if a == "--crate-type" { rest.get(i + 1).cloned() } else { a.strip_prefix("--crate-type=").map(str::to_string) }).collect();
-    // the program's binaries and test harnesses: their link arguments, which the native library is
-    // linked with (program_link_args). The stub's dep-info names the run's folder, so the next
-    // cargo run, with a folder of its own, does not take this one as fresh.
+    // the program's binaries and test harnesses: their linker and link arguments, which the native
+    // library is linked with (program_link). The stub's dep-info names the run's folder, so the
+    // next cargo run, with a folder of its own, does not take this one as fresh.
     let capture = std::env::var("RELAX_NATIVE_LINK_ARGS").ok().filter(|_| {
         std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some() && (types.iter().any(|t| t == "bin") || rest.iter().any(|a| a == "--test"))
     });
     if let Some(dir) = &capture {
-        let _ = std::fs::write(std::path::Path::new(dir).join(&name), link_args_of(rest).join("\n"));
+        let linker = linker_of(rest).unwrap_or_default();
+        let _ = std::fs::write(std::path::Path::new(dir).join(&name), format!("{linker}\n{}", link_args_of(rest).join("\n")));
     }
     let emit = value("--emit").unwrap_or_default();
     let json = value("--json").unwrap_or_default().contains("artifacts");
@@ -2087,4 +2138,40 @@ pub(crate) unsafe fn reset_statics() {
     reset(&STARTED, std::sync::atomic::AtomicBool::new(false));
     // read again by the next run: the toolchain may have been updated in between
     reset(&C_TOOLCHAIN, std::sync::OnceLock::new());
+}
+
+#[cfg(test)]
+#[test]
+fn the_native_library_links_with_the_programs_c_compiler_linker() {
+    let args = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
+    // cargo puts the config's target linker on the rustc command; the last one wins, as in rustc
+    assert_eq!(linker_of(&args("--crate-type bin -C linker=/nix/store/x-clang-wrapper/bin/clang -C link-arg=-fuse-ld=/m/bin/mold")), Some("/nix/store/x-clang-wrapper/bin/clang".to_string()));
+    assert_eq!(linker_of(&args("-Clinker=gcc -C linker=clang")), Some("clang".to_string()));
+    assert_eq!(linker_of(&args("--codegen=linker=x86_64-linux-gnu-gcc")), Some("x86_64-linux-gnu-gcc".to_string()));
+    assert_eq!(linker_of(&args("-C link-arg=-Wl,-rpath,/x")), None, "no linker named: the native library keeps cc");
+    // a bare linker or another flavor takes no C compiler's arguments
+    for bare in ["ld", "ld.lld", "/usr/bin/ld.gold", "x86_64-linux-gnu-ld", "lld", "rust-lld", "wasm-ld", "link", "lld-link"] {
+        assert_eq!(linker_of(&args(&format!("-C linker={bare}"))), None, "{bare}");
+    }
+    assert_eq!(linker_of(&args("-C linker=clang -C linker-flavor=ld.lld")), None);
+    assert_eq!(linker_of(&args("-C linker=clang -C linker-flavor=gcc")), Some("clang".to_string()));
+
+    // the wrapper's file per unit: the linker on the first line, then the link arguments
+    let dir = std::env::temp_dir().join(format!("relax-native-linker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("app"), "/bin/clang\n-fuse-ld=/m/bin/mold\n-Wl,-rpath,/x").unwrap();
+    std::fs::write(dir.join("other"), "\n-Wl,-rpath,/y").unwrap();
+    let flags: Vec<&String> = Vec::new();
+    assert_eq!(program_link(&dir, "app", &flags), (vec!["-fuse-ld=/m/bin/mold".to_string(), "-Wl,-rpath,/x".to_string()], Some("/bin/clang".to_string())));
+    assert_eq!(program_link(&dir, "other", &flags), (vec!["-Wl,-rpath,/y".to_string()], None));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // the cached cargo run keeps the linker beside the link arguments
+    let line = r#"{"relax_link_args":["-fuse-ld=/m/bin/mold"],"relax_linker":"/bin/clang"}"#;
+    let out = outputs_with(&[], &[], &[], &format!("{line}\n")).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((out.link_args, out.linker), (vec!["-fuse-ld=/m/bin/mold".to_string()], Some("/bin/clang".to_string())));
+    let old = r#"{"relax_link_args":["-Wl,-rpath,/x"]}"#;
+    let out = outputs_with(&[], &[], &[], &format!("{old}\n")).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out.linker, None, "a cache from before the linker was kept links with cc");
 }
