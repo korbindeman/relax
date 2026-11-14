@@ -695,11 +695,22 @@ fn cached(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<String>)],
     (there && same_runs && same_env).then_some(out)
 }
 
-/// The variables the script run that left `out_dir` declared with `rerun-if-env-changed` (cargo's
-/// `output` file beside it), each once, with this process's value (None: unset): cargo gives the
+/// cargo's record of the script run that left `out_dir`: the script's stdout, which cargo writes
+/// after every run, beside OUT_DIR (`build/<pkg>-<hash>/output`) or, in cargo's newer build-dir
+/// layout, in the run folder beside it (`build/<pkg>/<hash>/run/stdout`). Read only beside
+/// OUT_DIR, no run matched its receipt under the newer layout, and every warm `--allow-c` run
+/// built its native code again (11-14).
+fn script_stdout(out_dir: &str) -> std::path::PathBuf {
+    let out = std::path::Path::new(out_dir);
+    let output = out.with_file_name("output");
+    if output.is_file() { output } else { out.with_file_name("run").join("stdout") }
+}
+
+/// The variables the script run that left `out_dir` declared with `rerun-if-env-changed` (its
+/// stdout, [`script_stdout`]), each once, with this process's value (None: unset): cargo gives the
 /// script this environment.
 fn declared_env(out_dir: &str) -> Vec<(String, Option<String>)> {
-    let output = std::fs::read_to_string(std::path::Path::new(out_dir).with_file_name("output")).unwrap_or_default();
+    let output = std::fs::read_to_string(script_stdout(out_dir)).unwrap_or_default();
     let mut names: Vec<&str> = output.lines().filter_map(|l| {
         l.strip_prefix("cargo::").or_else(|| l.strip_prefix("cargo:"))?.strip_prefix("rerun-if-env-changed=")
     }).map(str::trim_end).collect();
@@ -708,12 +719,10 @@ fn declared_env(out_dir: &str) -> Vec<(String, Option<String>)> {
     names.into_iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect()
 }
 
-/// The script run that left `out_dir` as it is: cargo's `output` file beside it (the script's
-/// stdout, which cargo writes after every run), by length and modification time. Empty when
-/// there is none.
+/// The script run that left `out_dir` as it is: its stdout ([`script_stdout`]), by length and
+/// modification time. Empty when there is none.
 fn run_stamp(out_dir: &str) -> String {
-    let output = std::path::Path::new(out_dir).with_file_name("output");
-    std::fs::metadata(output).ok().and_then(|m| {
+    std::fs::metadata(script_stdout(out_dir)).ok().and_then(|m| {
         let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
         Some(format!("{}.{}", m.len(), t.as_nanos()))
     }).unwrap_or_default()
@@ -1928,40 +1937,47 @@ fn native_key_follows_the_resolved_closure_and_its_path_sources() {
 #[test]
 fn a_cached_cargo_run_stands_while_what_it_names_is_there() {
     let dir = std::env::temp_dir().join(format!("relax-native-cached-{}", std::process::id()));
-    let out_dir = dir.join("out");
-    std::fs::create_dir_all(&out_dir).unwrap();
-    let lib = dir.join("libnative.so");
-    let lib = lib.to_str().unwrap();
     let pkg = [(String::new(), "cfg_only".to_string(), "1.0.0".to_string())];
     let scripts = [(0, Vec::new())];
-    let quoted = out_dir.to_str().unwrap().replace('\\', "\\\\").replace('"', "\\\"");
-    // cargo's record of the script's run, beside its OUT_DIR
-    std::fs::write(dir.join("output"), b"cargo:rustc-cfg=has_feature\n").unwrap();
-    let run = run_stamp(out_dir.to_str().unwrap());
-    assert!(!run.is_empty());
-    let msg_run = |libs: &str, run: &str| format!(r#"{{"relax_host":false,"relax_run":"{run}","reason":"build-script-executed","package_id":"registry+https://example.test/index#cfg_only@1.0.0","linked_libs":{libs},"linked_paths":["native={quoted}"],"cfgs":["has_feature"],"env":[["GENERATED","yes"]],"out_dir":"{quoted}"}}"#);
-    let msg = |libs: &str| msg_run(libs, &run);
-    let hit = |m: &str| cached(&pkg, &scripts, &[0], m, lib).is_some();
-    // a script that links nothing leaves no library to find: cargo is not run again
-    assert!(hit(&msg("[]")), "a cfg/env-only script's run is reused without a library");
-    // one that links something needs the linked library
-    assert!(!hit(&msg(r#"["dylib=m"]"#)), "a system library to link, no library yet");
-    assert!(!hit(&msg(r#"["static=gen"]"#)), "an archive missing from its search path");
-    std::fs::write(out_dir.join("libgen.a"), b"!<arch>\n").unwrap();
-    assert!(!hit(&msg(r#"["static=gen"]"#)), "an archive to link, no library yet");
-    std::fs::write(lib, b"").unwrap();
-    assert!(hit(&msg(r#"["static=gen"]"#)) && hit(&msg(r#"["dylib=m"]"#)), "the linked library is there");
-    let m = msg("[]");
-    assert!(!hit(&m[..m.len() - 1]), "a cut-off message file is no hit");
-    // the OUT_DIR is shared with other keys' builds of the selection: a later run of the script
-    // (under another key) left it as that run wrote it, so the receipt is no hit
-    assert!(!hit(&msg_run("[]", "")), "a receipt that saw no run of the script");
-    std::fs::write(dir.join("output"), b"cargo:rustc-cfg=other_feature\n").unwrap();
-    assert!(!hit(&msg("[]")), "the script ran again since the receipt");
-    assert!(hit(&msg_run("[]", &run_stamp(out_dir.to_str().unwrap()))), "the receipt of that later run");
-    // generated sources live in OUT_DIR: a run whose OUT_DIR is gone is no hit, library or not
-    std::fs::remove_dir_all(&out_dir).unwrap();
-    assert!(!hit(&msg("[]")) && !hit(&msg(r#"["dylib=m"]"#)), "a removed OUT_DIR");
+    // cargo's record of the script's run (its stdout) beside its OUT_DIR, and in the run folder of
+    // cargo's newer build-dir layout: read only beside it, no warm run matched (11-14)
+    for (layout, home, stdout) in [("beside", "cfg_only-0123", "output"), ("run folder", "cfg_only/0123", "run/stdout")] {
+        let home = dir.join(home);
+        let out_dir = home.join("out");
+        let stdout = home.join(stdout);
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::create_dir_all(stdout.parent().unwrap()).unwrap();
+        let lib = home.join("libnative.so");
+        let lib = lib.to_str().unwrap();
+        let quoted = out_dir.to_str().unwrap().replace('\\', "\\\\").replace('"', "\\\"");
+        std::fs::write(&stdout, b"cargo:rustc-cfg=has_feature\ncargo:rerun-if-env-changed=RELAX_CACHED_RUN_UNSET\n").unwrap();
+        let run = run_stamp(out_dir.to_str().unwrap());
+        assert!(!run.is_empty(), "{layout}: the script's run is found");
+        assert_eq!(declared_env(out_dir.to_str().unwrap()), vec![("RELAX_CACHED_RUN_UNSET".to_string(), None)], "{layout}: the variables it declared");
+        let msg_run = |libs: &str, run: &str| format!(r#"{{"relax_host":false,"relax_run":"{run}","reason":"build-script-executed","package_id":"registry+https://example.test/index#cfg_only@1.0.0","linked_libs":{libs},"linked_paths":["native={quoted}"],"cfgs":["has_feature"],"env":[["GENERATED","yes"]],"out_dir":"{quoted}"}}"#);
+        let msg = |libs: &str| msg_run(libs, &run);
+        let hit = |m: &str| cached(&pkg, &scripts, &[0], m, lib).is_some();
+        // a script that links nothing leaves no library to find: cargo is not run again
+        assert!(hit(&msg("[]")), "{layout}: a cfg/env-only script's run is reused without a library");
+        // one that links something needs the linked library
+        assert!(!hit(&msg(r#"["dylib=m"]"#)), "{layout}: a system library to link, no library yet");
+        assert!(!hit(&msg(r#"["static=gen"]"#)), "{layout}: an archive missing from its search path");
+        std::fs::write(out_dir.join("libgen.a"), b"!<arch>\n").unwrap();
+        assert!(!hit(&msg(r#"["static=gen"]"#)), "{layout}: an archive to link, no library yet");
+        std::fs::write(lib, b"").unwrap();
+        assert!(hit(&msg(r#"["static=gen"]"#)) && hit(&msg(r#"["dylib=m"]"#)), "{layout}: the linked library is there");
+        let m = msg("[]");
+        assert!(!hit(&m[..m.len() - 1]), "{layout}: a cut-off message file is no hit");
+        // the OUT_DIR is shared with other keys' builds of the selection: a later run of the
+        // script (under another key) left it as that run wrote it, so the receipt is no hit
+        assert!(!hit(&msg_run("[]", "")), "{layout}: a receipt that saw no run of the script");
+        std::fs::write(&stdout, b"cargo:rustc-cfg=other_feature\n").unwrap();
+        assert!(!hit(&msg("[]")), "{layout}: the script ran again since the receipt");
+        assert!(hit(&msg_run("[]", &run_stamp(out_dir.to_str().unwrap()))), "{layout}: the receipt of that later run");
+        // generated sources live in OUT_DIR: a run whose OUT_DIR is gone is no hit, library or not
+        std::fs::remove_dir_all(&out_dir).unwrap();
+        assert!(!hit(&msg("[]")) && !hit(&msg(r#"["dylib=m"]"#)), "{layout}: a removed OUT_DIR");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
