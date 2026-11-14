@@ -439,6 +439,8 @@ mod unix {
     /// good). The main thread's pthread key destructors do not run either (the program's thread
     /// locals are left as they are, as in a rustc build).
     pub fn exit(code: i32) -> ! {
+        // (a validated warm start that missed recorded code fails under RELAX_WARM_STRICT)
+        let code = relax_codegen::warm::strict_code(code);
         super::run_program_atexit();
         crate::selfexe::remove();
         // An embedded run (the Android host: its library handle is named) failed: exit() would run the
@@ -1017,6 +1019,8 @@ mod imp {
     /// code) would run after Relax dropped the unit, and unix's exit() does not run the main
     /// thread's key destructors either.
     pub fn exit(code: i32) -> ! {
+        // (a validated warm start that missed recorded code fails under RELAX_WARM_STRICT)
+        let code = relax_codegen::warm::strict_code(code);
         super::run_program_atexit();
         crate::selfexe::remove();
         makepad_core_util::process_end::end_without_c_handlers(code)

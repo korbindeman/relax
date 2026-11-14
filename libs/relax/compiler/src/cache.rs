@@ -9236,6 +9236,57 @@ mod data_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// RELAX_WARM_STRICT fails a validated warm start that misses code a prior run of its cache
+    /// recorded (the cold run's ledger row says "recorded"), and names the slot with its key; a
+    /// slot no run recorded before (a path this start takes first) is accounting only.
+    #[test]
+    fn strict_fails_a_lost_recorded_entry_and_not_a_first_run_path() {
+        isolated_test!(strict_fails_a_lost_recorded_entry_and_not_a_first_run_path);
+        // (before anything reads it: warm::enabled is read once)
+        std::env::set_var("RELAX_WARM_STRICT", "1");
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-strict-lost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "#![no_std] pub fn kept() -> u32 { 1 } pub fn fresh() -> u32 { 2 }").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("a", dir.join("a.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let slot = |u: &mut Unit, name: &str| { let d = (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == name).unwrap(); u.fn_id(FnKey::Inst(d, vec![])) };
+        let (kept, fresh) = (slot(&mut u, "kept"), slot(&mut u, "fresh"));
+        let cache_dir = dir.join("cache");
+        // the cold run: kept runs, its code and its ledger row are recorded
+        let mut cache = open_test_cache(&u, &cache_dir);
+        assert!(cache.lookup(&mut u, kept).is_none(), "a cold cache");
+        cache.record(&u, kept, &[0xc3], &[], &[]);
+        cache.flush().unwrap();
+        let key = cache.slot_key(&u, kept).unwrap();
+        drop(cache);
+        // its entry lost on purpose: replaced by an empty one (newest wins; an empty code payload
+        // is a miss), its ledger row kept
+        let mut cache = open_test_cache(&u, &cache_dir);
+        cache.reject_verdict(&u, kept);
+        cache.flush().unwrap();
+        drop(cache);
+        // the warm start, validated (run.rs classify)
+        relax_codegen::warm::classify(true);
+        let mut cache = open_test_cache(&u, &cache_dir);
+        assert!(cache.lookup(&mut u, fresh).is_none(), "fresh never ran: no code of it");
+        assert_eq!(relax_codegen::warm::strict_code(0), 0, "a path this start takes first failed the strict run");
+        assert!(cache.lookup(&mut u, kept).is_none(), "kept's entry is gone");
+        let name = |id| crate::syms::stable_fn_name(&u, id);
+        assert_eq!(relax_codegen::warm::lost_slot(&name(kept)), Some((key, key)), "kept is the miss of recorded code, under its key");
+        assert_eq!(relax_codegen::warm::lost_slot(&name(fresh)), None, "fresh is no miss of recorded code");
+        assert_eq!(relax_codegen::warm::strict_code(0), 1, "a validated warm start that missed recorded code passed the strict run");
+        assert_eq!(relax_codegen::warm::strict_code(3), 3, "a failing run keeps its code");
+        drop(cache);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A proc macro's read of cargo's `[env]` (macro_reg::call_krate_env past the crate's own
     /// variables) is a late input of the invoking crate (sip LATE_CONFIG_ENV), present or absent:
     /// the crate's code store is stale when that configuration's value changes, and not when only
@@ -11269,9 +11320,16 @@ impl Linker {
         }
         if !found {
             if relax_codegen::warm::enabled() {
-                let reason = self.cache().miss_reason(u, id, key0);
-                warm_count::add(if reason.starts_with("cold record exists; lookup key changed") { warm_count::KEY_CHANGED } else if reason.starts_with("cold record exists") { warm_count::ENTRY_GONE } else { warm_count::NOT_RECORDED }, 1);
+                let (reason, recorded) = self.cache().miss_reason(u, id, key0);
+                warm_count::add(match recorded { Some(old) if old != key0 => warm_count::KEY_CHANGED, Some(_) => warm_count::ENTRY_GONE, None => warm_count::NOT_RECORDED }, 1);
                 relax_codegen::warm::reason(id, &reason);
+                // code a prior run of this cache recorded, which this start did not find: the
+                // strict verdict (warm::strict_code). An entry its certificate refused was found
+                // (an input it took in changed), and a live edit gives what it reaches new keys.
+                let refused = self.cache().cert_rejected.contains(&key);
+                if let Some(old) = recorded.filter(|_| !refused && crate::reload::program_edits() == 0) {
+                    relax_codegen::warm::recorded_miss(id, &crate::syms::stable_fn_name(u, id), key0, old);
+                }
             }
             self.cache().missed.insert(id);
             self.cache().stats.misses += 1;
@@ -11961,17 +12019,19 @@ impl Cache {
         self.push_pending(krate, NewEntry { key, kind: KIND_WARM_OUTCOME, payload: e.0 });
     }
 
-    fn miss_reason(&self, u: &Unit, id: u32, code_key: u128) -> String {
+    /// Why slot `id`'s lookup under `code_key` found no code, from the cold run's ledger, and the
+    /// key a prior run recorded its code under when one did.
+    fn miss_reason(&self, u: &Unit, id: u32, code_key: u128) -> (String, Option<u128>) {
         let outcome = self.get(self.outcome_key(u, id)).and_then(|(kind, bytes)| {
             if kind != KIND_WARM_OUTCOME { return None; }
             let mut d = D { b: bytes, p: 0 };
             Some((d.u128()?, d.str()?.to_owned()))
         });
         match outcome {
-            Some((old, reason)) if reason == "recorded" && old != code_key => "cold record exists; lookup key changed".to_owned(),
-            Some((_, reason)) if reason == "recorded" => "cold record exists; code entry unavailable".to_owned(),
-            Some((_, reason)) => reason,
-            None => "no standalone cold lookup/record observed; precise cause unresolved".to_owned(),
+            Some((old, reason)) if reason == "recorded" && old != code_key => ("cold record exists; lookup key changed".to_owned(), Some(old)),
+            Some((old, reason)) if reason == "recorded" => ("cold record exists; code entry unavailable".to_owned(), Some(old)),
+            Some((_, reason)) => (reason, None),
+            None => ("no standalone cold lookup/record observed; precise cause unresolved".to_owned(), None),
         }
     }
 }
