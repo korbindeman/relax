@@ -4706,7 +4706,7 @@ impl Cache {
         let mut before_present = 0;
         let mut present_ids = Vec::new();
         for (n, &id) in order.iter().enumerate() {
-            if n % 64 == 63 && stop() { return false; }
+            if n % 16 == 15 && stop() { return false; }
             if let Some(b) = self.slot_bytes(u, id) {
                 let entry = match self.slot_key(u, id) {
                     Some(k) if self.has_index(&k) || self.pending_keys.contains(&k) => k,
@@ -4722,8 +4722,16 @@ impl Cache {
         if self.verbose { eprintln!("relax cache: manifest phases: {} slots keyed in {:.1} ms", order.len(), t0.elapsed().as_secs_f64() * 1e3); }
         if stop() { return false; }
         crate::run::yield_section("manifest compare");
-        let old: HashSet<&[u8]> = self.manifest.iter().map(|b| b.as_slice()).collect();
-        let new = list.iter().filter(|b| !old.contains(b.0.as_slice())).count();
+        let mut old: HashSet<&[u8]> = HashSet::with_capacity(self.manifest.len());
+        for (i, b) in self.manifest.iter().enumerate() {
+            if i % 1024 == 1023 && stop() { return false; }
+            old.insert(b.as_slice());
+        }
+        let mut new = 0;
+        for (i, b) in list.iter().enumerate() {
+            if i % 1024 == 1023 && stop() { return false; }
+            new += !old.contains(b.0.as_slice()) as usize;
+        }
         // the same start as before (within 2%), the loaded manifest still valid and its image
         // current (within 2%, covering all but 2% of its cached slots, and at most 2% of its slots
         // ones no call reached while its window was open: jit::startup_set_called): no new one
@@ -4785,6 +4793,11 @@ impl Cache {
         // keeps). Removed with this manifest's write, its bytes are dead space: the store
         // rewrite drops them once they outgrow a quarter of the live ones (store.rs append).
         crate::run::yield_section("manifest superseded");
+        let mut written: HashSet<u128> = HashSet::with_capacity(list.len());
+        for (i, (b, _)) in list.iter().enumerate() {
+            if i % 1024 == 1023 && stop() { return false; }
+            written.insert(identity_hash(b));
+        }
         let mut gone: Vec<u128> = Vec::new();
         if self.manifest.len() == self.manifest_old_keys.len() {
             let old_keys: HashMap<&[u8], u128> = self.manifest.iter().zip(&self.manifest_old_keys)
@@ -4796,7 +4809,7 @@ impl Cache {
         }
         // (past the last yield check: this manifest is the run's)
         self.manifest_done = true; self.manifest_len = order.len();
-        self.written_ids = Some(list.iter().map(|(b, _)| identity_hash(b)).collect());
+        self.written_ids = Some(written);
         if n_img > 0 {
             self.image_built = Some((self.rewrite_sum(), n_img));
         }

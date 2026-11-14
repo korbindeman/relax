@@ -25,16 +25,18 @@ impl Cache {
     /// (the crates its key names and those of its dependency certificate) with their whole
     /// fingerprints now. A slot whose entry cannot be read here is left out (it links lazily).
     /// With the image, the slots it holds.
-    /// Err: `stop` said yes (asked every 256 slots); the caller drops the manifest for now.
+    /// Err: `stop` said yes; the caller drops the manifest for now. It is asked often enough that
+    /// no step holds the owner for more than a few ms between two asks (a refresh in the session
+    /// runs while the UI thread reaches new code: each of its first calls waits for the owner).
     pub(super) fn build_image(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool) -> Result<Option<(Vec<u8>, u32)>, ()> {
         let t0 = std::time::Instant::now();
         let mut ph = [0f64; 5];
         // the entry each slot takes, decided first (slot keys need the cache mutably)
         crate::run::yield_section("image chosen");
         let mut chosen: Vec<(u32, u128, Vec<u32>)> = Vec::with_capacity(ids.len());
-        let pend: HashMap<u128, usize> = self.pending.iter().enumerate().filter(|(_, e)| e.1.kind == KIND_CODE).map(|(i, e)| (e.1.key, i)).collect();
+        let pend = self.pending_of(KIND_CODE, stop)?;
         for (i, &id) in ids.iter().enumerate() {
-            if i % 64 == 63 && stop() { return Err(()); }
+            if i % 8 == 7 && stop() { return Err(()); }
             // interpreted slots link one by one (their code is not machine code to place); so do
             // sandboxed twins (the image prelinks before any sandbox is set up: not_in_image)
             if relax_codegen::interp::is_entry(u.fns[id as usize].code) || not_in_image(u, id) { continue; }
@@ -61,7 +63,13 @@ impl Cache {
         crate::run::yield_section("image twins");
         let twinlink = !relax_backend::stats::opt_off(&u.prog.session.options, "-twinlink");
         if stop() { return Err(()); }
-        let mut in_image: std::collections::HashSet<Vec<u8>> = if twinlink { chosen.iter().filter_map(|(id, _, _)| self.slot_bytes_known(*id)).collect() } else { Default::default() };
+        let mut in_image: std::collections::HashSet<Vec<u8>> = Default::default();
+        if twinlink {
+            for (i, (id, _, _)) in chosen.iter().enumerate() {
+                if i % 256 == 255 && stop() { return Err(()); }
+                if let Some(b) = self.slot_bytes_known(*id) { in_image.insert(b); }
+            }
+        }
         if stop() { return Err(()); }
         // ... or when the base has a code entry outside the image (stored, or written this run):
         // the next run's first call links it lazily, as it would the twin's. A hot twin's base
@@ -70,7 +78,7 @@ impl Cache {
         // Without this every warm launch ran the race's draw twins and built them at O3 again.
         if twinlink {
             for t in 0..u.fns.len() {
-                if t % 64 == 63 && stop() { return Err(()); }
+                if t % 16 == 15 && stop() { return Err(()); }
                 let crate::jit::FnKey::Plain(b) = u.fns[t].key else { continue };
                 if (b as usize) >= u.fns.len() || matches!(u.verdict_state(b), crate::jit::Verdict::Failed(_)) { continue; }
                 let Some(k) = self.slot_key(u, b) else { continue };
@@ -106,11 +114,12 @@ impl Cache {
         // the data objects the symbols name (tag 2), and the ones those name in turn: the
         // prelink places them as one block (place_data) instead of a link_data per object
         crate::run::yield_section("image data");
-        let pend_data: HashMap<u128, usize> = self.pending.iter().enumerate().filter(|(_, e)| e.1.kind == KIND_DATA).map(|(i, e)| (e.1.key, i)).collect();
+        let pend_data = self.pending_of(KIND_DATA, stop)?;
+        let pend_const = self.pending_of(KIND_CONST, stop)?;
         let mut data = ImageData::default();
         let mut i = 0;
         while i < tab.syms.list.len() {
-            if i % 64 == 63 && stop() { return Err(()); }
+            if i % 8 == 7 && stop() { return Err(()); }
             let b = &tab.syms.list[i];
             if b.first() == Some(&2) && b.len() >= 17 {
                 let k = u128::from_le_bytes(b[1..17].try_into().unwrap());
@@ -119,20 +128,20 @@ impl Cache {
             } else if b.first() == Some(&3) {
                 // a static: its cached initial value (const_value's object) goes with the data
                 let b = b.clone();
-                if let Some(o) = self.static_value_obj(u, &b, &mut data) {
+                if let Some(o) = self.static_value_obj(u, &b, &mut data, &pend_const) {
                     data.statics.push((i as u32, o));
                 }
             }
             i += 1;
-            // (a symbol can pull in many objects, each a store read: asked every 32 of them too)
+            // (a symbol can pull in many objects, each a store read: asked every 8 of them too)
             let mut m = 0u32;
             while let Some(o) = data.queue.pop() {
                 self.image_data_obj(&mut tab, &mut data, o as usize, &pend_data);
                 m += 1;
-                if m % 32 == 0 && stop() { return Err(()); }
+                if m % 8 == 0 && stop() { return Err(()); }
             }
         }
-        data.settle();
+        data.settle(stop).ok_or(())?;
         ph[1] = t0.elapsed().as_secs_f64() * 1e3;
         if stop() { return Err(()); }
         // the functions thunk symbols name (fn pointers in data: vtables, callbacks) are keys
@@ -141,6 +150,7 @@ impl Cache {
         crate::run::yield_section("image thunks");
         let mut thunk_keys = Vec::new();
         for i in 0..tab.syms.list.len() {
+            if i % 1024 == 1023 && stop() { return Err(()); }
             let b = &tab.syms.list[i];
             if b.first() == Some(&7) && b.len() > 9 {
                 let key = b[1..b.len() - 8].to_vec();
@@ -279,13 +289,13 @@ impl Cache {
 
     /// The data object of the cached initial value of the static image symbol `b` names (tag 3:
     /// its definition), if the cache has one.
-    fn static_value_obj(&mut self, u: &Unit, b: &[u8], data: &mut ImageData) -> Option<u32> {
+    fn static_value_obj(&mut self, u: &Unit, b: &[u8], data: &mut ImageData, pend: &HashMap<u128, usize>) -> Option<u32> {
         let def = self.dec_def(u, &mut D { b, p: 1 })?;
         let (key, _, _) = self.const_key(u, def, &[])?;
         // (only a value this run certified: a stored one that no longer holds stays out)
         if !self.const_live.contains(&key) { return None; }
-        let payload = match self.pending.iter().find(|e| e.1.key == key && e.1.kind == KIND_CONST) {
-            Some(e) => &e.1.payload[..],
+        let payload = match pend.get(&key) {
+            Some(&i) => &self.pending[i].1.payload[..],
             None => match self.get(key) {
                 Some((KIND_CONST, p)) => p,
                 _ => return None,
@@ -390,15 +400,18 @@ impl Cache {
         }
         if let Some(ids) = self.image_ids.as_ref() {
             for id in ids.first..ids.first + ids.pending.len() as u32 {
+                if id % 1024 == 1023 && stop() { return Err(()); }
                 if let Some(b) = ids.bytes_of(id) { by_bytes.entry(b.to_vec()).or_insert(id); }
             }
         }
         if stop() { return Err(()); }
         let mut have: HashSet<u32> = chosen.iter().map(|c| c.0).collect();
+        if stop() { return Err(()); }
         // called: compiled at a call (a speculative build is installed at its first call), and not
         // a slot the startup image put in that no call reached since. A slot only inlined into
         // other code was not called, and neither were the calls to it in the code taken here.
         let not_called = crate::jit::prelinked_not_called(u);
+        if stop() { return Err(()); }
         let ran = |c: u32| {
             let f = &u.fns[c as usize];
             f.compiled && f.spec_state != 1 && !not_called.contains(&c)
@@ -406,14 +419,16 @@ impl Cache {
         let mut i = 0;
         let mut added = 0;
         while i < chosen.len() {
-            if i % 64 == 63 && stop() { return Err(()); }
+            // (each slot a store read of its code and its callees' keys: asked at every one)
+            if stop() { return Err(()); }
             let k = chosen[i].1;
             i += 1;
             let callees: Vec<u32> = match self.image_payload(k, pend).and_then(call_targets) {
                 Some(t) => t.into_iter().filter_map(|b| by_bytes.get(b).copied()).collect(),
                 None => continue,
             };
-            for c in callees {
+            for (j, c) in callees.into_iter().enumerate() {
+                if j % 16 == 15 && stop() { return Err(()); }
                 if (c as usize) >= u.fns.len() || have.contains(&c) || !ran(c) || relax_codegen::interp::is_entry(u.fns[c as usize].code) || not_in_image(u, c) { continue; }
                 have.insert(c);
                 let Some(key0) = self.slot_key(u, c) else { continue };
@@ -428,6 +443,17 @@ impl Cache {
             eprintln!("relax cache: startup image: {} slots its code calls added", added);
         }
         Ok(())
+    }
+
+    /// The entries of kind `kind` recorded this run (not yet written): key to their position in
+    /// `pending` (the last of a key's records).
+    fn pending_of(&self, kind: u32, stop: &dyn Fn() -> bool) -> Result<HashMap<u128, usize>, ()> {
+        let mut m = HashMap::new();
+        for (i, e) in self.pending.iter().enumerate() {
+            if i % 4096 == 4095 && stop() { return Err(()); }
+            if e.1.kind == kind { m.insert(e.1.key, i); }
+        }
+        Ok(m)
     }
 
     /// A code entry's payload: recorded this run (not yet written), or in the index.
@@ -593,17 +619,19 @@ impl ImageData {
     }
 
     /// An object pointing to one that could not be read cannot be placed either.
-    fn settle(&mut self) {
+    /// None: `stop` said yes (asked every 256 objects of each round).
+    fn settle(&mut self, stop: &dyn Fn() -> bool) -> Option<()> {
         loop {
             let mut changed = false;
             for o in 0..self.objs.len() {
+                if o % 256 == 255 && stop() { return None; }
                 if self.objs[o].ok && self.objs[o].rel.iter().any(|&(_, t, x, _)| t == DATA_OBJ && !self.objs[x as usize].ok) {
                     self.objs[o].ok = false;
                     changed = true;
                 }
             }
             if !changed {
-                return;
+                return Some(());
             }
         }
     }
@@ -615,11 +643,11 @@ impl ImageData {
         4 + objs + ok(&self.sym) + ok(&self.statics)
     }
 
-    /// None: `stop` said yes (asked every 256 objects)
+    /// None: `stop` said yes (asked every 64 objects)
     fn encode(&self, e: &mut E, stop: &dyn Fn() -> bool) -> Option<()> {
         e.u32(self.objs.len() as u32);
         for (i, r) in self.objs.iter().enumerate() {
-            if i % 256 == 255 && stop() { return None; }
+            if i % 64 == 63 && stop() { return None; }
             e.u128(r.key);
             e.u8(r.ok as u8);
             if !r.ok {
