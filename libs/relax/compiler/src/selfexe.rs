@@ -169,14 +169,17 @@ fn make_link(root: &Path, key: &str, loader: &Path, dirs: &[&Path], link: &Path)
     }
 }
 
-/// Whether `link` is a link of the loader file `of` (at `loader`): that file, or where the link is
-/// on another volume than the loader, the loader's copy there (`link_loader`).
+/// Whether `link` is a link of the loader file `of` (at `loader`): that file, or the loader's copy
+/// (`link_loader`). The copy can be on the loader's own device: a bind mount (NixOS mounts
+/// /nix/store read-only on the root file system) refuses a hard link across it with EXDEV while
+/// both sides report one device, so a run's link to the copy was taken for another file, and the
+/// next run failed making it again ("hard link ...: File exists (os error 17)").
 fn is_link_of(link: &Path, of: &FileId, loader: &Path, copies: &Path) -> bool {
-    match file_id(link) {
-        Some(l) if l.volume == of.volume => l.index == of.index,
-        Some(l) => copy_name(loader).and_then(|n| file_id(&copies.join(n))).is_some_and(|c| c.volume == l.volume && c.index == l.index),
-        None => false,
+    let Some(l) = file_id(link) else { return false };
+    if l.volume == of.volume && l.index == of.index {
+        return true;
     }
+    copy_name(loader).and_then(|n| file_id(&copies.join(n))).is_some_and(|c| c.volume == l.volume && c.index == l.index)
 }
 
 /// The name of the loader file's copy on another volume (`link_loader`): its length and
@@ -911,6 +914,27 @@ mod tests {
         assert_eq!(linked, (true, true, false), "a hard link is its file and has its key; a copy is another file");
         assert_eq!(replaced, (true, false), "the file that replaced the loader has another key and is not the link's");
         assert_eq!(parent, Some(std::process::id()), "the parent of a child of this process");
+    }
+
+    /// A link of the loader's copy is the loader's link on the loader's own device too: a bind
+    /// mount (/nix/store on NixOS) shares the device and refuses the hard link, so the copy is
+    /// what the run dir holds, and the next run must take it as made, not make it again.
+    #[test]
+    fn a_link_of_the_copy_on_the_loaders_device_is_the_loaders_link() {
+        let dir = std::env::temp_dir().join(format!("relax-copy-same-device-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let copies = dir.join(COPIES);
+        std::fs::create_dir_all(&copies).unwrap();
+        let (loader, link, other) = (dir.join("loader"), dir.join("cove"), dir.join("other"));
+        std::fs::write(&loader, b"the loader").unwrap();
+        let copy = copies.join(copy_name(&loader).unwrap());
+        std::fs::copy(&loader, &copy).unwrap();
+        std::fs::hard_link(&copy, &link).unwrap();
+        std::fs::write(&other, b"the loader").unwrap();
+        let of = file_id(&loader).unwrap();
+        let seen = (is_link_of(&link, &of, &loader, &copies), is_link_of(&other, &of, &loader, &copies), is_link_of(&loader, &of, &loader, &copies));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(seen, (true, false, true), "the copy's link is the loader's; another file is not; the loader is its own");
     }
 
     // (Linux: /dev/shm is a volume of its own a test can write to; the Mac and the Windows node
