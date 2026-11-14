@@ -1173,7 +1173,10 @@ static PATCH_PAUSE: AtomicBool = AtomicBool::new(false);
 /// failed after 30 s, "the compiler's front end stayed busy (read by makepad at typeck_ahead)".
 /// Such a thread runs on and is held once it has left the front end (the pause's sweep). A
 /// patch's pause holds every thread, as it reads their stacks before its install. Async-signal-
-/// safe (the Linux hold handler asks): two atomic loads.
+/// safe (the Linux hold handler asks): two atomic loads. Where a pause holds threads: the Apple
+/// pause, the Linux and Android aarch64 hold handler (inspect/threads.rs); elsewhere a pause
+/// holds no thread.
+#[cfg(any(target_vendor = "apple", target_os = "linux", all(target_os = "android", target_arch = "aarch64")))]
 pub(crate) fn pause_lets_front_readers_go() -> bool {
     PAUSED.load(Relaxed) && !PATCH_PAUSE.load(Relaxed)
 }
