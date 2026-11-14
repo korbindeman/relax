@@ -627,6 +627,14 @@ impl Plan {
                         (part.namespace, part.input_id) = names.snapshot(*ci);
                         part.namespace_id = crate::crate_image::file_hash("", &part.namespace);
                     }
+                } else if rust_lazy && by_name[c.name.as_str()].last() != Some(&*ci) {
+                    // A package's library and binary share a name, so the recording cannot tell
+                    // their tables apart in the final names: a crate whose name a later crate also
+                    // has takes its namespace now, its projection after its prepare. (The last one's
+                    // is the final names' projection, as every other crate's: the recording takes it.)
+                    // Its id stays 0: the recording seals it (recorded_parts).
+                    let _snapshot = crate::load_profile::span(profile, "rust-demand-namespace-shared", &c.name);
+                    (part.namespace, part.input_id) = names.snapshot(*ci);
                 }
                 part.macros.finish_capture(&table, &c.name);
                 part.files = prepared_files[files_start..].to_vec();
