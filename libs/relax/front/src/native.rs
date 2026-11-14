@@ -379,7 +379,7 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     // ---- the key: what the native scripts' outputs depend on. Not the package the run is for,
     // and of the resolved graph only the native closure (the packages whose scripts or libs
     // cargo builds for real): two packages whose closure resolves alike share the build.
-    let selection = selection_key(&script_pkgs, &lib_pkgs);
+    let selection = selection_key(&script_pkgs, &lib_pkgs, c_toolchain());
     // (v16: a receipt holds its scripts' declared variables, `cached`)
     let mut h = fnv(b"native-link-v16", 0xcbf29ce484222325);
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
@@ -889,7 +889,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     flags: &[&String], script_pkgs: &[String], lib_pkgs: &[String], seeds: &[usize], tier: Tier) -> Result<String, String> {
     // Cargo does not track the wrapper's selection environment. An empty stub
     // from another selection must never count as a fresh real library.
-    let selection = selection_key(script_pkgs, lib_pkgs);
+    let selection = selection_key(script_pkgs, lib_pkgs, c_toolchain());
     let target = match tier { Tier::Fast => format!("{}/native/cargo-target/{selection:016x}", relax_dir), Tier::Optimized => format!("{}/native/cargo-target-opt/{selection:016x}", relax_dir) };
     let target = std::path::absolute(&target).map_err(|e| format!("native target directory: {e}"))?;
     // Cargo can put intermediate files outside target_directory. Resolve its
@@ -1094,13 +1094,31 @@ fn json_string(s: &str) -> String {
     o
 }
 
-fn selection_key(scripts: &[String], libs: &[String]) -> u64 {
-    let mut h = fnv(b"target-compiler-probes-v5-link-args", 0xcbf29ce484222325);
+/// The cargo selection of a native build (its own cargo target): the packages whose scripts and
+/// libraries cargo builds for real, and the C toolchain they are built with (`c_toolchain`).
+fn selection_key(scripts: &[String], libs: &[String], toolchain: &[u8]) -> u64 {
+    let mut h = fnv(b"target-compiler-probes-v6-toolchain", 0xcbf29ce484222325);
     for list in [scripts, libs] {
         h = fnv(b"\xff", h);
         for name in list { h = fnv(name.as_bytes(), h); h = fnv(b"\0", h); }
     }
-    h
+    h = fnv(b"\xff", h);
+    fnv(toolchain, h)
+}
+
+/// The C toolchain a native build runs, as `cc --version` names it (the compiler's version and,
+/// for clang, the folder it is installed in); empty without a C compiler. Read once per run.
+/// Build scripts write the toolchain's paths into what they print and leave (a link search path
+/// into the compiler's runtime folder, a CMake cache naming the compiler), and cargo does not run a
+/// script again when the toolchain changes: after a toolchain update those outputs named folders
+/// the update had removed. Another toolchain is another selection, whose scripts run.
+static C_TOOLCHAIN: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+fn c_toolchain() -> &'static [u8] {
+    C_TOOLCHAIN.get_or_init(|| {
+        let out = Command::new(cc()).arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output();
+        crate::zone_alloc::kept_with(|| out.map(|o| o.stdout).unwrap_or_default())
+    })
 }
 
 /// `native/lock`, held exclusively: a root is written, or a prune decides what goes. None when
@@ -1764,7 +1782,13 @@ fn script_selection_follows_every_unit_of_a_package() {
     assert!(is_target_out_dir("/w/build/x86_64-unknown-linux-gnu/release/build/a-1/out", build, "x86_64-unknown-linux-gnu"));
     assert!(!is_target_out_dir("/w/build/release/build/a-1/out", build, "x86_64-unknown-linux-gnu"));
     assert!(!is_target_out_dir("/elsewhere/x86_64-unknown-linux-gnu/out", build, "x86_64-unknown-linux-gnu"));
-    assert_ne!(selection_key(&["a".into()], &["b".into()]), selection_key(&["a".into(), "b".into()], &[]));
+    let (scripts, libs): (Vec<String>, Vec<String>) = (vec!["a".into()], vec!["b".into()]);
+    assert_ne!(selection_key(&scripts, &libs, b""), selection_key(&["a".into(), "b".into()], &[], b""), "a script package is not a library package");
+    // a toolchain update: the scripts' outputs name the old toolchain's folders, and cargo would not
+    // run them again in the same selection
+    let clang = |v: &str| format!("Apple clang version {v}\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n");
+    assert_ne!(selection_key(&scripts, &libs, clang("17.0.0").as_bytes()), selection_key(&scripts, &libs, clang("17.0.1").as_bytes()), "another C toolchain is another cargo selection");
+    assert_eq!(selection_key(&scripts, &libs, clang("17.0.0").as_bytes()), selection_key(&scripts, &libs, clang("17.0.0").as_bytes()));
 }
 
 #[cfg(test)]
@@ -1991,4 +2015,6 @@ fn a_shared_path_packages_files_are_hashed_in_its_checkout() {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&STARTED, std::sync::atomic::AtomicBool::new(false));
+    // read again by the next run: the toolchain may have been updated in between
+    reset(&C_TOOLCHAIN, std::sync::OnceLock::new());
 }
