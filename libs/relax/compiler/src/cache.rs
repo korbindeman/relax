@@ -8937,6 +8937,61 @@ mod data_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// An instance key is read only as the generics of the fn it names: one a program with other
+    /// generics recorded (a parameter added, an `impl Trait` parameter, one of its impl's) decodes
+    /// to no key, as a type key of an edited ADT does; a key of an unchanged fn still decodes. The
+    /// count the decoder checks (Tcx::fn_generic_count) is the signature's, for every shape here.
+    #[test]
+    fn an_instance_key_of_other_generics_decodes_to_no_key() {
+        isolated_test!(an_instance_key_of_other_generics_decodes_to_no_key);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let session = std::sync::Arc::new(crate::Session::default());
+        let root = std::env::temp_dir().join(format!("relax-inst-arity-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("lib.rs");
+        let load = |text: &str| {
+            std::fs::write(&source, text).unwrap();
+            let mut prog = crate::program::Program::new(&session);
+            prog.load_crate("inst_arity", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+            let mut tcx = crate::tcx::Tcx::new();
+            tcx.collect(&prog);
+            Unit::new(prog, tcx, 0)
+        };
+        let named = |u: &Unit, name: &str| (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == name && matches!(u.prog.def(d).kind, DefKind::Fn | DefKind::AssocFn)).unwrap();
+        let tail = "pub trait Tr<P> { fn t<C>(&self, _: C, _: P) {} } pub fn k<const N: usize>() {}";
+        let u = load(&format!("#![no_std] pub fn f<T>(_: T) {{}} pub fn g(_: u32) {{}} pub struct S<A>(A); impl<A> S<A> {{ pub fn m<'a, B>(&'a self, _: B) {{}} }} {tail}"));
+        let (i, n) = (u.tcx.tys.i32_, u.tcx.tys.intern(TyKind::Const(u.tcx.tys.const_usize(3))));
+        let keys = [("f", vec![i]), ("g", vec![]), ("m", vec![i, i]), ("t", vec![i, i, i]), ("k", vec![n])];
+        let mut cache = open_test_cache(&u, &root.join("cache"));
+        let mut encoded = Vec::new();
+        for (name, args) in &keys {
+            let def = named(&u, name);
+            assert_eq!(u.tcx.fn_generic_count(&u.prog, def), u.tcx.fn_sig(&u.prog, def).map(|s| s.n_generics), "`{name}`: the count is the signature's");
+            assert_eq!(u.tcx.fn_generic_count(&u.prog, def), Some(args.len() as u32), "`{name}`'s instance arguments");
+            let mut bytes = E::default();
+            assert!(cache.enc_fnkey(&u, &FnKey::Inst(def, args.clone()), &mut bytes, &mut vec![], 0).is_some(), "`{name}` encodes");
+            encoded.push(bytes.0);
+        }
+        drop(cache);
+        // f takes another parameter, g an `impl Trait` one, m's impl another; t and k are as they were
+        let mut v = load(&format!("#![no_std] pub fn f<T, U>(_: T, _: U) {{}} pub fn g(_: impl Copy) {{}} pub struct S<A, Z = u8>(A, Z); impl<A, Z> S<A, Z> {{ pub fn m<'a, B>(&'a self, _: B) {{}} }} {tail}"));
+        for (name, _) in &keys {
+            let def = named(&v, name);
+            assert_eq!(v.tcx.fn_generic_count(&v.prog, def), v.tcx.fn_sig(&v.prog, def).map(|s| s.n_generics), "edited `{name}`: the count is the signature's");
+        }
+        let mut cache = open_test_cache(&v, &root.join("cache"));
+        for ((name, args), bytes) in keys.iter().zip(&encoded) {
+            let key = unsafe { Linker::new(&mut cache).dec_fnkey(&mut v, &mut D { b: bytes, p: 0 }, 0) };
+            let kept = matches!(*name, "t" | "k");
+            match key {
+                Some(FnKey::Inst(def, a)) => assert!(kept && v.prog.name(def) == *name && a.len() == args.len(), "`{name}`'s key decoded to {:?} with {} arguments", v.prog.name(def), a.len()),
+                other => assert!(!kept && other.is_none(), "`{name}`'s key decoded to {other:?}"),
+            }
+        }
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// A code store is checked by its ledger: the `env!`/`include!` inputs of its crate's
     /// dependency closure. `r::name::<s::T>` folds `s`'s `env!` constant, and `r` is deeper than
     /// `s` without depending on it: the entry went to `r`'s store, whose ledger does not list
@@ -10718,7 +10773,13 @@ impl Linker {
         Some(match KeyKind::of(d.u8()?)? {
             KeyKind::Inst => {
                 let def = self.cache().dec_def(u, d)?;
-                FnKey::Inst(def, self.cache().dec_tys(u, d, 0)?)
+                let args = self.cache().dec_tys(u, d, 0)?;
+                // a key a program with other generics recorded (an edited fn, as dec_ty's ADTs): no
+                // instance of this program, so no key
+                if u.tcx.fn_generic_count(&u.prog, def).is_some_and(|n| n as usize != args.len()) {
+                    return None;
+                }
+                FnKey::Inst(def, args)
             }
             KeyKind::ClosureInFile => {
                 let file = self.cache().dec_file(u, d)?;

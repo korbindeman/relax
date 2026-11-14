@@ -1406,6 +1406,33 @@ impl Tcx {
         ast.list(generics.params).iter().filter(|g| !matches!(g.kind, GenericParamKind::Lifetime(_))).count() as u32
     }
 
+    /// The type and const parameters of fn item `d`, the generic arguments of its instances: its
+    /// impl's, or its trait's with `Self` first, then its own and one per `impl Trait` parameter,
+    /// as [`Tcx::item_env`] names them and `fn_sig(d).n_generics` counts them, without lowering
+    /// the signature (a warm start's key decode asks it of every instance key it reads). None for
+    /// what is no fn item.
+    pub fn fn_generic_count(&self, prog: &Program, d: DefId) -> Option<u32> {
+        let def = prog.def(d);
+        if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn) {
+            return None;
+        }
+        let ast = &prog.files[def.file as usize].ast;
+        let ItemKind::Fn(sig, _, _) = &ast.item(def.item).kind else { return None };
+        let sig = ast.fn_sig(*sig);
+        let parent = match (def.parent != NO_DEF).then(|| prog.def(def.parent).kind) {
+            Some(DefKind::Impl) => self.impl_generic_count(prog, def.parent),
+            Some(DefKind::Trait) => {
+                let pd = prog.def(def.parent);
+                let past = &prog.files[pd.file as usize].ast;
+                if past.as_trait(&past.item(pd.item).kind).is_some() { 1 + self.trait_generic_count(prog, def.parent) as u32 } else { 0 }
+            }
+            _ => 0,
+        };
+        let own = ast.list(sig.generics.params).iter().filter(|g| !matches!(g.kind, GenericParamKind::Lifetime(_))).count() as u32;
+        let synthetic = fn_impl_trait_params(ast, sig).into_iter().filter(|t| matches!(ast.ty(*t), ast::Ty::ImplTrait(_))).count() as u32;
+        Some(parent + own + synthetic)
+    }
+
     /// The impl's parameters and lifetime resolution, before its self type is lowered.
     fn impl_header_env(&self, prog: &Program, d: DefId, file: u32, generics: &ast::Generics) -> GenEnv {
         let mut env = GenEnv::default();
