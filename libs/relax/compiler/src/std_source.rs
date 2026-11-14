@@ -47,16 +47,15 @@ pub fn select(workspace: &str, fallback: &std::path::Path) {
 /// program lies: this build's codegen identity (the compiler that compiles and runs the script,
 /// and its answers to the script's RUSTC questions: rustc_answer, RUSTC_VERSION) and the std the
 /// script compiles against (`std_stamp`), which a run takes from its tree or RELAX_STD, not from
-/// its build. Once per process.
+/// its build. Read at each resolve that runs scripts, never kept for the process: a run that ends
+/// in place and starts again after a std edit keys its scripts by the std it now compiles against
+/// (the walk of ~400 entries is a millisecond; restart_statics).
 pub fn script_tool() -> u128 {
-    static ID: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
-    *ID.get_or_init(|| {
-        let mut h = crate::sip::Sip128::new();
-        h.str("relax-script-tool");
-        h.u128(crate::codegen_id::id());
-        h.str(&std_stamp(&crate::std_dir()));
-        h.finish128()
-    })
+    let mut h = crate::sip::Sip128::new();
+    h.str("relax-script-tool");
+    h.u128(crate::codegen_id::id());
+    h.str(&std_stamp(&crate::std_dir()));
+    h.finish128()
 }
 
 /// The std tree at `dir` as a key: its mount's commit when a repository serves it (vfs identity),
