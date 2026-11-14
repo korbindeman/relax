@@ -998,6 +998,18 @@ pub struct Cache {
     /// carries a fresh image
     image_slots: usize,
     image_stale: usize,
+    /// how many of `manifest`'s slots are the startup manifest's own: the rest are its session tail
+    /// (the slots the last quit's run installed past them, record_tail)
+    manifest_main: usize,
+    /// the identities (identity_hash) of the startup manifest this run wrote: the quit's session
+    /// tail is the install order past them
+    written_ids: Option<HashSet<u128>>,
+    /// the replacements (rewrite_sum) when this run last built the startup image, and its slots:
+    /// an in-session rebuild is due once 5% of them were replaced since (image_refresh_due)
+    image_built: Option<(u64, usize)>,
+    /// the identities (identity_hash) of the loaded manifest's slots before its first present,
+    /// made at the first ask (cache/image.rs was_startup_slot)
+    startup_ids: std::sync::OnceLock<HashSet<u128>>,
     /// the tier of each code entry this run recorded (by key), pending or written: a verified O1
     /// rebuild replaces only an entry below O1
     rec_tier: HashMap<u128, u8>,
@@ -1389,6 +1401,10 @@ impl Cache {
             manifest_len: 0,
             image_slots: 0,
             image_stale: 0,
+            manifest_main: 0,
+            written_ids: None,
+            image_built: None,
+            startup_ids: std::sync::OnceLock::new(),
             rec_tier: HashMap::new(),
             manifest_root: None,
             linked_key: HashMap::new(),
@@ -4477,6 +4493,14 @@ impl Cache {
         Some(h.finish128())
     }
 
+    /// Key of a startup manifest's session tail (record_tail).
+    fn manifest_tail_key(&self, manifest: u128) -> u128 {
+        let mut h = Sip128::new();
+        h.str("startup slots tail");
+        h.u128(manifest);
+        h.finish128()
+    }
+
     /// Key of the entry naming the sources a startup manifest's code keys were made from.
     fn manifest_sources_key(&self, manifest: u128) -> u128 {
         let mut h = Sip128::new();
@@ -4536,6 +4560,8 @@ impl Cache {
         self.pending_verdicts = old.pending_verdicts.clone();
         self.manifest_done = old.manifest_done;
         self.manifest_len = old.manifest_len;
+        self.written_ids = old.written_ids.clone();
+        self.image_built = old.image_built;
         self.collected_committed = true;
         self.stats = old.stats.clone();
         // the same program (settle_rebuild compares it): the same item graph and definitions
@@ -4590,12 +4616,39 @@ impl Cache {
                             Some(self.crate_ident.iter().enumerate().map(|(c, id)| recorded.get(id).is_some_and(|fp| self.fp_now(c) == Some(*fp))).collect())
                         })
                     };
+                    // the session tail the last quit wrote (record_tail): the slots its run installed
+                    // past this manifest's, seeded after them (jit::spec_seed_manifest); their keys
+                    // only when recorded from these very sources
+                    let main = out.len();
+                    if let Some((KIND_MANIFEST, t)) = pk.get_checked(self.manifest_tail_key(key)) {
+                        let fp = self.sources_fp();
+                        let seen: HashSet<u128> = out.iter().map(|b| identity_hash(b)).collect();
+                        let mut d = D { b: t, p: 0 };
+                        let _ = (|| {
+                            if d.u32()? != ENTRY_VERSION {
+                                return None;
+                            }
+                            let same = d.u128()? == fp;
+                            let n = d.u32()? as usize;
+                            for _ in 0..n {
+                                let b = d.bytes()?;
+                                let k = d.u128()?;
+                                if !seen.contains(&identity_hash(b)) {
+                                    out.push(b.to_vec());
+                                    keys.push(if same && k != 0 && self.has_index(&k) { k } else { 0 });
+                                }
+                            }
+                            Some(())
+                        })();
+                        if self.verbose { eprintln!("relax cache: the startup manifest's session tail: {} slots past its {}", out.len() - main, main); }
+                    }
                     if let Some(crates) = crates.filter(|_| missing == 0 && self.mode != Mode::Verify) {
                         self.manifest_keys = out.iter().zip(&keys).filter(|(_, k)| **k != 0).map(|(b, k)| (identity_hash(b), *k)).collect();
                         self.manifest_key_crates = crates;
                     }
                     self.manifest = out;
                     self.manifest_old_keys = keys;
+                    self.manifest_main = main;
                     self.manifest_present = present;
                     self.manifest_missing = missing;
                     self.manifest_uncached = uncached;
@@ -4674,8 +4727,11 @@ impl Cache {
         // the same start as before (within 2%), the loaded manifest still valid and its image
         // current (within 2%, covering all but 2% of its cached slots, and at most 2% of its slots
         // ones no call reached while its window was open: jit::startup_set_called): no new one
-        let image_current = !self.image_rewrite
-            && (self.image_slots == 0 || ((self.image_stale + (self.stats.rewrite_why[0] + self.stats.rewrite_why[1]) as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49 && crate::jit::not_called_at_present() * 50 <= self.image_slots));
+        let image_current = !self.image_rewrite && match self.image_built {
+            // this run's image: its slots replaced since it was built
+            Some((at, n)) => self.rewrite_sum().saturating_sub(at) as usize * 50 <= n,
+            None => self.image_slots == 0 || ((self.image_stale + self.rewrite_sum() as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49 && crate::jit::not_called_at_present() * 50 <= self.image_slots),
+        };
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true; self.manifest_len = order.len();
             return true;
@@ -4705,6 +4761,9 @@ impl Cache {
         // the entry first (the yield checks: nothing is queued before the last of them)
         crate::run::yield_section("manifest entry");
         let mut e = E::default();
+        // (its whole size at once, as build_image's: the image copied below would grow it in steps
+        // that each move all of it between two yield checks)
+        e.0.reserve(img.as_ref().map_or(0, |i| i.0.len()) + list.iter().map(|(b, _)| b.len() + 20).sum::<usize>() + 16);
         e.u32(ENTRY_VERSION);
         e.u32(list.len() as u32);
         e.u32(before_present as u32);
@@ -4737,6 +4796,10 @@ impl Cache {
         }
         // (past the last yield check: this manifest is the run's)
         self.manifest_done = true; self.manifest_len = order.len();
+        self.written_ids = Some(list.iter().map(|(b, _)| identity_hash(b)).collect());
+        if n_img > 0 {
+            self.image_built = Some((self.rewrite_sum(), n_img));
+        }
         let mut removed = 0;
         for o in gone {
             let Some((p, _)) = self.index_at(o) else { continue };
@@ -4753,6 +4816,75 @@ impl Cache {
         self.push_pending(root, NewEntry { key: self.manifest_sources_key(key), kind: KIND_MANIFEST, payload: f.0 });
         self.image_rewrite = false;
         true
+    }
+
+    /// The quit's record of the session (on the owner thread): the slots of this run's install
+    /// order past the startup manifest the next start loads (the one this run wrote, else the
+    /// loaded one's own slots) become its session tail, which the next start's speculative workers
+    /// link ahead after its first present, after the manifest's later slots. The manifest and its
+    /// image stay as written: rebuilding the image at the quit held the exit for a second and more
+    /// (image_refresh_due rebuilds it in the session instead).
+    /// `stop` as for record_manifest: yes drops this record (false), a later pass makes it again.
+    pub fn record_tail(&mut self, u: &Unit, root: u32, order: &[u32], stop: &dyn Fn() -> bool) -> bool {
+        if self.mode == Mode::ReadOnly || self.keys_moved != 0 || !self.layout_edited.is_empty() {
+            return true;
+        }
+        let Some(key) = self.manifest_key(root) else { return true };
+        let t0 = std::time::Instant::now();
+        let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
+        let known = match self.written_ids.take() {
+            Some(w) => w,
+            None => self.manifest[..self.manifest_main.min(self.manifest.len())].iter().map(|b| identity_hash(b)).collect(),
+        };
+        crate::run::yield_section("manifest tail keys");
+        let mut list: Vec<(Vec<u8>, u128)> = Vec::new();
+        let mut gave_way = false;
+        for (n, &id) in order.iter().enumerate() {
+            if n % 64 == 63 && stop() { gave_way = true; break; }
+            let Some(b) = self.slot_bytes(u, id) else { continue };
+            if known.contains(&identity_hash(&b)) {
+                continue;
+            }
+            let entry = match self.slot_key(u, id) {
+                Some(k) if self.has_index(&k) || self.pending_keys.contains(&k) => k,
+                _ => 0,
+            };
+            list.push((b, entry));
+        }
+        self.written_ids = Some(known);
+        if gave_way || stop() {
+            return false;
+        }
+        let mut e = E::default();
+        e.u32(ENTRY_VERSION);
+        e.u128(if crate::reload::edited_crates().is_empty() { self.sources_fp() } else { 0 });
+        e.u32(list.len() as u32);
+        for (b, entry) in &list {
+            e.bytes(b);
+            e.u128(*entry);
+        }
+        self.push_pending(root, NewEntry { key: self.manifest_tail_key(key), kind: KIND_MANIFEST, payload: e.0 });
+        if self.verbose {
+            eprintln!("relax cache: the startup manifest's session tail: {} of the {} slots installed, in {:.1} ms", list.len(), order.len(), t0.elapsed().as_secs_f64() * 1e3);
+        }
+        true
+    }
+
+    /// An in-session rebuild of the startup image is due (the mid-run writes): more than 5% of its
+    /// slots had their code replaced since it was built or loaded (O2/O3 over the O1 code: the next
+    /// start leaves those lazy). A cold run tiers up for minutes after its first write.
+    pub fn image_refresh_due(&self) -> bool {
+        let (since, n) = match self.image_built {
+            Some((at, n)) => (self.rewrite_sum().saturating_sub(at) as usize, n),
+            None => (self.image_stale + self.rewrite_sum() as usize, self.image_slots),
+        };
+        self.manifest_done && self.mode == Mode::On && n > 0 && since * 20 > n
+    }
+
+    /// Code entries replaced this run that may be image code (record: an entry without a recorded
+    /// tier, or one moved to a higher tier).
+    fn rewrite_sum(&self) -> u64 {
+        self.stats.rewrite_why[0] + self.stats.rewrite_why[1]
     }
 
     pub fn flush_front_graphs() -> Result<(), String> {

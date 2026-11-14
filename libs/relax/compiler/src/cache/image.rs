@@ -124,8 +124,12 @@ impl Cache {
                 }
             }
             i += 1;
+            // (a symbol can pull in many objects, each a store read: asked every 32 of them too)
+            let mut m = 0u32;
             while let Some(o) = data.queue.pop() {
                 self.image_data_obj(&mut tab, &mut data, o as usize, &pend_data);
+                m += 1;
+                if m % 32 == 0 && stop() { return Err(()); }
             }
         }
         data.settle();
@@ -165,6 +169,10 @@ impl Cache {
         }
         crate::run::yield_section("image encode");
         let mut e = E::default();
+        // its whole size at once: growing it past the tables to the code copied below moved tens of
+        // MB in one step between two yield checks
+        e.0.reserve(slots.0.len() + blob.len() + tab.keys.list.iter().chain(&tab.syms.list).chain(&tab.files.list).map(|b| b.len() + 4).sum::<usize>()
+            + data.objs.iter().map(|r| 48 + r.bytes.len() + r.name.as_ref().map_or(0, |n| n.len()) + r.rel.len() * 17).sum::<usize>() + key_crates.len() * 8 + (64 << 10));
         e.u32(tab.crates.len() as u32);
         for &c in &tab.crates {
             e.u128(self.crate_ident[c as usize]);
@@ -336,6 +344,13 @@ impl Cache {
             r.bytes = bytes;
             r.rel = rel;
         }
+    }
+
+    /// Slot `id` was one of the slots the loaded manifest's run installed before its first present
+    /// (its identity is in the manifest's startup part): an earlier run called it then.
+    pub(crate) fn was_startup_slot(&self, id: u32) -> bool {
+        let set = self.startup_ids.get_or_init(|| self.manifest[..self.manifest_present.min(self.manifest.len())].iter().map(|b| identity_hash(b)).collect());
+        self.slot_bytes_known(id).is_some_and(|b| set.contains(&identity_hash(&b)))
     }
 
     /// Slot `id`'s encoded key, already computed (memo of `slot_bytes`), or the key the prelink

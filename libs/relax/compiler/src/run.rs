@@ -4527,9 +4527,13 @@ static MID_YIELDS: AtomicU64 = AtomicU64::new(0);
 fn mid_yielded() {
     MID_YIELDS.fetch_add(1, Ordering::Relaxed);
 }
-/// The manifest's slot count when a mid-run write last recorded it: the quit write records it
-/// again with the session's later installs
+/// The install order's length when a mid-run write last recorded the manifest (or its tail): the
+/// quit write records the session's later installs as its tail
 static MID_MANIFEST_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The last mid-run write found an in-session rebuild of the startup image due (cache
+/// image_refresh_due): the next one opens the stores spills wrote first, as the image takes their
+/// entries
+static IMAGE_REFRESH_WANTED: AtomicBool = AtomicBool::new(false);
 
 /// Compile totals since boot, the startup list for the aot levels, and the JSON report.
 /// jit::wall_ns() when main was called (RELAX_MAIN_COMPILE_LOG's time base)
@@ -4867,7 +4871,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     // the stores earlier spills wrote, opened here when the startup manifest may be recorded below
     // (cache.rs open_written): its image takes their entries, and the request only indexes them
     if jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
-        && (!MID_MANIFEST_DONE.load(Ordering::Relaxed) || jit::QUIT_SEEN.load(Ordering::Relaxed)) {
+        && (!MID_MANIFEST_DONE.load(Ordering::Relaxed) || jit::QUIT_SEEN.load(Ordering::Relaxed) || IMAGE_REFRESH_WANTED.load(Ordering::Relaxed)) {
         let dir = MID_CACHE_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(dir) = dir { crate::cache::open_written(&dir); }
     }
@@ -4891,27 +4895,37 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         probe.tick("records");
         yield_section("manifest");
         // the startup manifest, once its window has closed (first present + 5 s after main):
-        // what the exit recorded before, so a killed or force-quit app starts warm too; the exit
-        // writes it again only if O2 code replaced startup code since (record_manifest)
-        // (the quit write records it again when the session installed more since: the whole
-        // session's order, linked ahead by the next launch)
-        let again = jit::QUIT_SEEN.load(Ordering::Relaxed) && MID_MANIFEST_DONE.load(Ordering::Relaxed) && u.start_order.len() > MID_MANIFEST_LEN.load(Ordering::Relaxed);
-        if u.cache.is_some() && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!MID_MANIFEST_DONE.swap(true, Ordering::Relaxed) || again) {
-            MID_MANIFEST_LEN.store(u.start_order.len(), Ordering::Relaxed);
+        // what the exit recorded before, so a killed or force-quit app starts warm too. Later in
+        // the session its image is made again once a twentieth of its code was replaced (a cold
+        // run tiers up for minutes: cache image_refresh_due), and the quit write records the
+        // session's later installs as the manifest's tail (record_tail), linked ahead by the next
+        // launch, without making the image again
+        let done = MID_MANIFEST_DONE.load(Ordering::Relaxed);
+        let quit = jit::QUIT_SEEN.load(Ordering::Relaxed);
+        let tail = quit && done && u.start_order.len() > MID_MANIFEST_LEN.load(Ordering::Relaxed);
+        let refresh = !quit && done && u.cache.as_ref().is_some_and(|c| c.image_refresh_due());
+        if u.cache.is_some() && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!done || tail || refresh) {
+            MID_MANIFEST_DONE.store(true, Ordering::Relaxed);
+            let len = u.start_order.len();
             let (order, present) = jit::manifest_order(&*u, u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
                 // a waiting request (a frame's lazy compile, a live patch, a back end's Job) goes
                 // first: the manifest is made again by a later write
                 let stop = || { probe.tick("manifest"); quit_write_gives_way() };
-                if !c.record_manifest(u, crate::layout::root_crate(), &order, present, &stop) {
-                    MID_MANIFEST_DONE.store(false, Ordering::Relaxed);
+                let root = crate::layout::root_crate();
+                let made = if tail { c.record_tail(u, root, &order, &stop) } else { c.record_manifest(u, root, &order, present, &stop) };
+                if made {
+                    MID_MANIFEST_LEN.store(len, Ordering::Relaxed);
+                } else {
+                    MID_MANIFEST_DONE.store(done, Ordering::Relaxed);
                     mid_yielded();
                     verbose!("relax cache: startup manifest yielded to a waiting request; retried later");
                 }
             }
             u.cache = cache;
         }
+        IMAGE_REFRESH_WANTED.store(!quit && u.cache.as_ref().is_some_and(|c| c.image_refresh_due()), Ordering::Relaxed);
         parts[0] = held.elapsed().as_secs_f64() * 1e3;
         let Some(c) = u.cache.as_mut() else {
             return None;
@@ -5678,6 +5692,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&MID_COLLECTED_TRIED, AtomicBool::new(false));
     reset(&MID_MANIFEST_DONE, AtomicBool::new(false));
     reset(&MID_MANIFEST_LEN, std::sync::atomic::AtomicUsize::new(0));
+    reset(&IMAGE_REFRESH_WANTED, AtomicBool::new(false));
     reset(&MID_CACHE_DIR, relax_session::sync::Mutex::new(None));
     reset(&MAIN_START_WALL, AtomicU64::new(0));
     reset(&QUIT_WRITE_DONE, AtomicBool::new(false));

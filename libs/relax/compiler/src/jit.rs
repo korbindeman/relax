@@ -1677,6 +1677,9 @@ pub static ORDER_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
 /// How many of those installs came while the startup image's window was open (the first present
 /// and the frame after it: postframe::image_window_open): the next start prelinks them.
 pub static ORDER_PRESENT_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The positions in the install order (Unit::start_order) of the slots this run's startup image
+/// installed (prelink_startup): [start, end).
+static PRELINKED_ORDER: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
 /// The counted slots this run's startup image installed ahead of any call (prelink_startup).
 static PRELINKED_AHEAD: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
 /// Those of them no call had reached when the startup image's window closed (taken by the next
@@ -1737,19 +1740,37 @@ fn take_not_called(u: &Unit) {
 /// slot of the next one, so an image only grew (the callees add_called puts in became startup slots
 /// in turn, and theirs after them) and its prelink before main with it. One called later goes
 /// behind the startup set, as a later first install would; one never called is left out.
+/// An image slot whose calls the window cannot see -- final from its stored verdict (its count
+/// stub is out of the slot) or without a count stub (glue, shims) -- stays only if the loaded
+/// manifest had it in its startup set (Cache::was_startup_slot); the image's callees among them
+/// go behind it (a warm start kept ~18,000 such slots, ~12,000 of them callees no startup code
+/// called, and each next image prelinked them before main).
 fn startup_set_called(u: &Unit, order: Vec<u32>, present: usize) -> (Vec<u32>, usize) {
     take_not_called(u);
     let late: crate::fxhash::HashSet<u32> = NOT_CALLED_AT_PRESENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or_else(Default::default, |v| v.iter().copied().collect());
-    if late.is_empty() {
+    let (p0, p1) = (PRELINKED_ORDER[0].load(Ordering::Relaxed), PRELINKED_ORDER[1].load(Ordering::Relaxed));
+    if late.is_empty() && p0 == p1 {
         return (order, present);
     }
+    let cache = u.cache.as_ref();
+    let unseen = |i: usize, id: u32| {
+        if i < p0 || i >= p1 {
+            return false;
+        }
+        let st = unsafe { (*tier_rec(&u.slots, id).add(3)).load(Ordering::Acquire) };
+        (st == 0 || st == T_FINAL) && !cache.is_some_and(|c| c.was_startup_slot(id))
+    };
     let mut out = Vec::with_capacity(order.len());
     let mut later = Vec::new();
-    for &id in &order[..present] {
-        if !late.contains(&id) {
-            out.push(id);
-        } else if !unsafe { not_called_since_armed(u, id) } {
+    for (i, &id) in order[..present].iter().enumerate() {
+        if late.contains(&id) {
+            if !unsafe { not_called_since_armed(u, id) } {
+                later.push(id);
+            }
+        } else if unseen(i, id) {
             later.push(id);
+        } else {
+            out.push(id);
         }
     }
     let n = out.len();
@@ -1889,6 +1910,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
         let options = (&*up).prog.session.clone().options.clone();
         let gandalf = crate::borrowck::lazy::gandalf_enabled(&options);
         let mut notes = Vec::new();
+        PRELINKED_ORDER[0].store((&*up).start_order.len(), Ordering::Relaxed);
         let n = crate::cache::prelink_unit(up, &mut |u: &mut Unit, slots: Vec<crate::cache::PrelinkedSlot>| {
             u.code.write().unwrap_or_else(|e| e.into_inner()).reserve(slots.len());
             crate::zone_alloc::kept_with(|| u.start_order.reserve(slots.len()));
@@ -1905,6 +1927,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
                 stored_tier_verdict(&*up, id, v, base);
             }
         });
+        PRELINKED_ORDER[1].store((&*up).start_order.len(), Ordering::Relaxed);
         Some((n, notes))
     });
     let Some((n, notes)) = prelinked else { return 0 };
@@ -31598,6 +31621,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&QUIT_SEEN, AtomicBool::new(false));
     reset(&ORDER_UNTIL_NS, AtomicU64::new(0));
     reset(&ORDER_PRESENT_LEN, std::sync::atomic::AtomicUsize::new(0));
+    for p in &PRELINKED_ORDER {
+        p.store(0, Ordering::Relaxed);
+    }
     reset(&PRELINKED_AHEAD, relax_session::sync::Mutex::new(Vec::new()));
     reset(&NOT_CALLED_AT_PRESENT, relax_session::sync::Mutex::new(None));
     reset(&NOT_CALLED_TAKEN, AtomicBool::new(false));
