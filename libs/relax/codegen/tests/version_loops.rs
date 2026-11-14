@@ -634,14 +634,15 @@ fn divisibility_tests_fold() {
                 relax_backend::passes::simplify(&relax_session::Options::default(), &mut f, None, true, true);
                 assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::IBin(IOp::Rem | IOp::MulHi, ..))), "c {c} bits {bits}: {:?}", f.blocks[0].insts);
                 let m = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-                let mut xs: Vec<u64> = vec![0, 1, 2, c - 1, c, c + 1, 2 * c, 3 * c - 1, m, m - 1, m / c * c, m / c * c + 1];
+                // inputs around c and m, taken mod 2^64 (then masked to the width): c near u64::MAX wraps
+                let mut xs: Vec<u64> = vec![0, 1, 2, c.wrapping_sub(1), c, c.wrapping_add(1), c.wrapping_mul(2), c.wrapping_mul(3).wrapping_sub(1), m, m - 1, m / c * c, (m / c * c).wrapping_add(1)];
                 let mut s = 0x9E37_79B9_7F4A_7C15u64;
                 for _ in 0..2000 {
                     s ^= s << 13;
                     s ^= s >> 7;
                     s ^= s << 17;
                     xs.push(s & m);
-                    xs.push((s % 1000) * c & m);
+                    xs.push((s % 1000).wrapping_mul(c) & m);
                 }
                 for xv in xs.iter().map(|v| v & m) {
                     assert_eq!(eval(&orig, &[xv], &[]), eval(&f, &[xv], &[]), "x {xv} c {c} bits {bits} eq {eq}");
