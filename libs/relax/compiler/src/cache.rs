@@ -9029,7 +9029,8 @@ mod data_tests {
         // one run under `policy`: whether the slot hit (a miss is recorded), the parser options
         // identity and crate a's front store name
         let mut run = |policy: Policy| -> (bool, u128, String, u128) {
-            crate::sandbox::set_policy(policy);
+            // (this test plays both entry points)
+            unsafe { relax_base::compile_time::replace_policy_in_test(policy) };
             let mut cache = open_test_cache(&u, &dir.join("cache"));
             let hit = cache.lookup(&mut u, id).is_some();
             if !hit { cache.record(&u, id, &[0xc3], &[], &[]); }
@@ -9153,7 +9154,8 @@ mod data_tests {
         let open = |u: &Unit, ws: &std::path::Path, policy: Policy, config: Option<&str>| -> Cache {
             // Safety: no other thread of this test reads or notes late inputs
             unsafe { relax_session::reset_statics() };
-            crate::sandbox::set_policy(policy);
+            // (this test plays both entry points)
+            unsafe { relax_base::compile_time::replace_policy_in_test(policy) };
             crate::crates::set_config_env(config.map(|v| (K.to_string(), v.to_string())).into_iter().collect());
             let call = crate::macro_reg::with_call_krate("dep");
             assert_eq!(crate::macro_reg::call_krate_env(K).as_deref(), config, "dep's macro reads [env]'s value");
