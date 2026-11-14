@@ -1,7 +1,11 @@
 # Relax
 
 > [!WARNING]
-> **Experimental.** Relax is for development iteration: running, testing and live-editing your program while you work on it. Build anything you release with Rust itself: `cargo build --release` with rustc. So far it has been tested mostly in Makepad's own edit-run loop and only lightly on other projects, so expect rough edges elsewhere and please report them.
+> **Experimental, and not affiliated with Rust.** Relax, its compiler and its JIT included, is not affiliated with or endorsed by the Rust project or the Rust Foundation. It is an AI-generated reimplementation of the Rust language, designed to minimise latency for LLMs working with Rust code, and should be viewed only as an experimental developer tool. Rust is a trademark of the Rust Foundation.
+>
+> **It does not inherit Rust's safety guarantees automatically.** rustc's checks, and the memory safety they give safe code, hold under Relax only as far as Relax reimplements them correctly. Relax can contain any number of bugs at runtime, and a bug in Relax can make a correct program, safe code included, misbehave or crash.
+>
+> Relax is for development iteration: running, testing and live-editing your program while you work on it. Build anything you release with Rust itself: `cargo build --release` with rustc. So far it has been tested mostly in Makepad's own edit-run loop and only lightly on other projects, so expect rough edges elsewhere and please report them.
 
 ### Rust without the wait.
 
@@ -44,6 +48,7 @@ builds and its tests pass on Linux x86-64 and macOS arm64. Windows isn't tested.
   header, or macro waits for a restart, which Relax offers: `relax inspect <pid> session relaunch`.
 - **The borrow checker runs beside the program.** A run type-checks each function before it runs and
   borrow-checks in the background; `relax run --check-first` waits for the borrow checker instead.
+- **Not Rust's guarantees.** Relax is an AI-generated reimplementation, not rustc, and is not affiliated with the Rust project. Safe Rust is only as safe under Relax as Relax's own checks and code generation are correct, and a bug there can break a correct program at runtime.
 - **Not a release build.** Relax is for the edit-run loop. Ship what `cargo build --release` builds.
   So far it has been tested mostly in Makepad's own edit-run loop and only lightly on other projects, so expect rough edges elsewhere and please report them.
 
