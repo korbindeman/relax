@@ -22,8 +22,12 @@
 //! the loader's, in the loader's own section where its linker placed them, as that crate's other
 //! statics are rustc's. A copy laid out from source would be a second one whose code is the
 //! crate's own (a `#[relax_api]` entry's key memo, a handle's field offsets), which JIT code may
-//! not run. A program that is a Relax host itself (a runner's test running its runner under a
-//! test harness, which binds the CPU budget) reads the entries of the crates it compiled.
+//! not run. The `#[relax_api]` table is the one such section a program reads: where the crate's
+//! entries would lie, its block holds the loader's own (`relax_api::Entry` is `repr(C)`, the
+//! program's checked to be laid out as the loader's), so `relax_api::entries()` lists what it
+//! lists under rustc. A program that is a Relax host itself (a runner's test running its runner
+//! under a test harness, which binds the CPU budget) binds those crates to the loader's code, as
+//! the loader does, rather than compiling them again.
 
 use crate::ast::{ItemId, ItemKind};
 use crate::jit::Unit;
@@ -131,23 +135,52 @@ fn lay_out(u: &mut Unit, group: &str) -> (u64, u64) {
     }
     // the current versions only: a replaced file's defs stay for old frames
     let current: std::collections::HashSet<u32> = u.prog.mods.iter().map(|m| m.file).collect();
-    let mut members: Vec<(String, DefId)> = Vec::new();
+    // (part, 0, the program's static) or (part, 1, a provided crate's index in u.provided): a
+    // provided crate's `#[relax_api]` entries, the loader's, where its link puts the crate's own
+    let mut members: Vec<(String, u8, u32)> = Vec::new();
+    let mut provided: Vec<(String, usize, DefId)> = Vec::new();
     for (i, def) in u.prog.defs.iter().enumerate() {
-        if def.kind != DefKind::Static || !current.contains(&def.file) || u.provided.iter().any(|(k, _)| *k == def.krate) {
+        if def.kind != DefKind::Static || !current.contains(&def.file) {
             continue;
         }
-        if let Some(s) = item_section(&u.prog.files[def.file as usize], def.item) {
-            if group_of(&s) == group {
-                members.push((s, DefId(i as u32)));
+        let Some(s) = item_section(&u.prog.files[def.file as usize], def.item) else { continue };
+        if group_of(&s) != group {
+            continue;
+        }
+        match u.provided.iter().position(|(k, _)| *k == def.krate) {
+            None => members.push((s, 0, i as u32)),
+            Some(p) => provided.push((s, p, DefId(i as u32))),
+        }
+    }
+    // per provided crate, its first static that is an entry decides (its layout checked once)
+    let mut judged: Vec<usize> = Vec::new();
+    for (s, p, d) in provided {
+        if judged.contains(&p) {
+            continue;
+        }
+        if let Some(same) = loader_table(u, d, p) {
+            judged.push(p);
+            if same {
+                members.push((s, 1, p as u32));
             }
         }
     }
     // COFF orders a group's parts by name; within a part (and on ELF and Mach-O) the program's
-    // definition order stands for the link order
+    // definition order stands for the link order, the provided crates' entries after its own
     members.sort();
     let mut laid = Vec::new();
+    let mut copied: Vec<(u64, usize)> = Vec::new();
     let (mut size, mut align) = (0u64, 1u64);
-    for &(_, d) in &members {
+    for &(_, from, x) in &members {
+        if from == 1 {
+            let (n, a) = (u.provided[x as usize].1.table.len() as u64, std::mem::align_of::<relax_api::Entry>() as u64);
+            size = size.div_ceil(a) * a;
+            copied.push((size, x as usize));
+            size += n * std::mem::size_of::<relax_api::Entry>() as u64;
+            align = align.max(a);
+            continue;
+        }
+        let d = DefId(x);
         let Some(t) = u.tcx.const_ty(&u.prog, d) else {
             // its type's error is its own; it takes no room
             crate::zone_alloc::kept_with(|| u.statics.insert(d, 0));
@@ -162,6 +195,14 @@ fn lay_out(u: &mut Unit, group: &str) -> (u64, u64) {
     }
     // one byte past the end: the end bound is an address inside the block
     let base = u.rw_data(size + 1, align.max(8));
+    for &(off, p) in &copied {
+        for (i, e) in u.provided[p].1.table.iter().enumerate() {
+            let at = base + off + (i * std::mem::size_of::<relax_api::Entry>()) as u64;
+            // SAFETY: [at, at + size_of Entry) lies in the block just allocated for it, and `e`
+            // is a whole entry of the loader's table
+            unsafe { std::ptr::copy_nonoverlapping(*e as *const relax_api::Entry as *const u8, at as *mut u8, std::mem::size_of::<relax_api::Entry>()) };
+        }
+    }
     crate::zone_alloc::kept_with(|| {
         for &(d, _, off, len) in &laid {
             u.statics.insert(d, base + off);
@@ -173,6 +214,42 @@ fn lay_out(u: &mut Unit, group: &str) -> (u64, u64) {
         u.init_static(d, t, base + off, len);
     }
     (base, base + size)
+}
+
+/// Whether provided crate `u.provided[p]`'s static `d` is one of its `#[relax_api]` entries (a
+/// `relax_api::Entry`; None: it is not), and the program's `relax_api` laid out as the loader's
+/// (Some(true)): its block then takes the loader's entries of the crate (`ProvidedCrate::table`).
+/// Another static of a provided crate stays the loader's alone (`place`). A program whose `Entry`
+/// is laid out otherwise (another relax_api than the loader's) is told so (Some(false)): the
+/// loader's entries would not read as its own.
+fn loader_table(u: &mut Unit, d: DefId, p: usize) -> Option<bool> {
+    use relax_api::Entry;
+    let t = u.tcx.const_ty(&u.prog, d)?;
+    let TyKind::Adt(adt, _, _) = u.tcx.tys.kind(t).clone() else { return None };
+    if u.prog.def_path(adt) != std::any::type_name::<Entry>() {
+        return None;
+    }
+    let l = u.layout_of(t);
+    let rustc = [
+        std::mem::offset_of!(Entry, kind),
+        std::mem::offset_of!(Entry, module),
+        std::mem::offset_of!(Entry, key),
+        std::mem::offset_of!(Entry, sig),
+        std::mem::offset_of!(Entry, shim),
+        std::mem::offset_of!(Entry, slots),
+        std::mem::offset_of!(Entry, size),
+        std::mem::offset_of!(Entry, align),
+        std::mem::offset_of!(Entry, offsets),
+        std::mem::offset_of!(Entry, drop),
+    ];
+    if l.size as usize == std::mem::size_of::<Entry>() && l.align as usize == std::mem::align_of::<Entry>() && l.fields.iter().map(|&f| f as usize).eq(rustc) {
+        return Some(true);
+    }
+    let (size, align, fields) = (l.size, l.align, l.fields.clone());
+    let def = u.prog.def(d);
+    let at = u.pos_str(def.file, u.prog.files[def.file as usize].ast.item(def.item).lo);
+    u.note_error(format!("{}: `{}` is a #[relax_api] entry of provided crate `{}`, but this program's `relax_api::Entry` is laid out otherwise than the loader's (size {} align {} fields {:?}, the loader's {} {} {:?}): its relax_api is not the loader's -- rebuild makepad from this tree", at, u.prog.def_path(d), u.provided[p].1.name, size, align, fields, std::mem::size_of::<Entry>(), std::mem::align_of::<Entry>(), rustc));
+    Some(false)
 }
 
 /// The address of static or bound `d` of output section `group` (`bound`: which end), the section
@@ -411,7 +488,7 @@ mod tests {
         let mut u = crate::jit::Unit::new(prog, tcx, core);
         // the crate provided as the loader provides the CPU budget (no op listed)
         unsafe extern "C" fn no_panic_text(_: *mut *const u8, _: *mut usize) {}
-        let fixture = crate::provided::ProvidedCrate { name: "provided_section".into(), shims: Default::default(), types: Default::default(), layouts: Default::default(), per_side: Default::default(), last_panic: no_panic_text, source: 0, binding: 0, manifest: &[] };
+        let fixture = crate::provided::ProvidedCrate { name: "provided_section".into(), shims: Default::default(), types: Default::default(), layouts: Default::default(), per_side: Default::default(), last_panic: no_panic_text, source: 0, binding: 0, manifest: &[], table: Vec::new() };
         u.provided.push((krate, fixture));
         let (group, bound) = u.section_place(entry).expect("ENTRY is in a link section");
         assert_eq!(bound, None);

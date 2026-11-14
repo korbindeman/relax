@@ -73,11 +73,15 @@ pub struct ProvidedCrate {
     pub binding: u64,
     /// Per-file and feature/version identity embedded by the loader build.
     pub manifest: &'static [u8],
+    /// the crate's `#[relax_api]` entries as the loader's linker laid them down (its
+    /// `relax_api::entries()`, in their order): the program's `relax_api` table takes these where
+    /// rustc's link would put the crate's own (sections.rs lay_out)
+    pub table: Vec<&'static relax_api::Entry>,
 }
 
 impl Clone for ProvidedCrate {
     fn clone(&self) -> Self {
-        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), per_side: self.per_side.clone(), last_panic: self.last_panic, source: self.source, binding: self.binding, manifest: self.manifest }
+        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), per_side: self.per_side.clone(), last_panic: self.last_panic, source: self.source, binding: self.binding, manifest: self.manifest, table: self.table.clone() }
     }
 }
 
@@ -89,7 +93,8 @@ pub(crate) fn registered(name: &str) -> bool {
 }
 
 /// Registers a provided crate (before `cli_main`): its `#[relax_api]` entries as the loader read
-/// them from its own binary (relax_api::entries), and the panic-text accessor.
+/// them from its own binary (relax_api::entries; `table`: all of them, as laid down), and the
+/// panic-text accessor.
 pub fn register(
     name: &str,
     shims: HashMap<String, Shim>,
@@ -99,10 +104,11 @@ pub fn register(
     last_panic: LastPanicFn,
     source: u64,
     manifest: &'static [u8],
+    table: Vec<&'static relax_api::Entry>,
 ) {
     let name = name.replace('-', "_");
     let binding = binding_identity(&name, &shims, &types, &layouts, &per_side);
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, per_side, last_panic, source, binding, manifest });
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, per_side, last_panic, source, binding, manifest, table });
 }
 
 /// The identity of what JIT code depends on in a provided crate beyond its source text (which

@@ -245,7 +245,7 @@ fn an_opaque_types_own_methods_are_made_off_the_owner() {
     // the fixture's crate provided as the loader provides makepad-script: Handle an opaque handle
     // laid out as rustc does, no op listed
     unsafe extern "C" fn no_panic_text(_: *mut *const u8, _: *mut usize) {}
-    let fixture = crate::provided::ProvidedCrate { name: "opaque_front".into(), shims: Default::default(), types: Default::default(), layouts: Default::default(), per_side: Default::default(), last_panic: no_panic_text, source: 0, binding: 0, manifest: &[] };
+    let fixture = crate::provided::ProvidedCrate { name: "opaque_front".into(), shims: Default::default(), types: Default::default(), layouts: Default::default(), per_side: Default::default(), last_panic: no_panic_text, source: 0, binding: 0, manifest: &[], table: Vec::new() };
     u.provided.push((krate, fixture));
     u.provided_types.insert(handle_d, 0);
     assert!(u.provided_rustc_layout(handle_d));
