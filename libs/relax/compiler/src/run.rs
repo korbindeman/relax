@@ -1178,9 +1178,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // a profile is a test's: `makepad run` builds as the release profile does. A test's start of
     // its package's binary (CARGO_BIN_EXE_<name>, which names it in RELAX_ARG0) has the test's, as
     // cargo builds the binary with the test (relax issue 207), and so has that binary's run of
-    // itself again (from its run's link)
+    // itself again (from its run's link), and the check `makepad test` makes of the package's bins
+    // (test_pkg.rs start_bin_check)
     let test_binary = || std::env::var_os("RELAX_ARG0").is_some() || std::env::current_exe().and_then(|e| e.canonicalize()).is_ok_and(|e| crate::selfexe::is_link(&e));
-    if unitgraph::test_profile().is_some() && !harness && !plain_test && !test_binary() { return usage(); }
+    if unitgraph::test_profile().is_some() && !harness && !plain_test && !check && !test_binary() { return usage(); }
     driver_options.verbose &= !silent();
     VERBOSE.store(driver_options.verbose, Ordering::Relaxed);
     if driver_options.verbose { crate::tui::track_for_verbose(); }

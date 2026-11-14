@@ -1216,14 +1216,19 @@ pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &
     let bins = enabled(&m.bins, bin_names)?;
     let tests = enabled(&m.tests, test_names)?;
     let examples = enabled(&m.examples, example_names)?;
-    let mut all_examples = Vec::new();
-    for t in &m.examples {
-        if t.enabled(&features, false)? {
-            all_examples.push((t.name.clone(), t.path.clone(), t.harness));
+    let every = |targets: &[Target]| -> Result<Vec<(String, String, bool)>, String> {
+        let mut out = Vec::new();
+        for t in targets {
+            if t.enabled(&features, false)? {
+                out.push((t.name.clone(), t.path.clone(), t.harness));
+            }
         }
-    }
-    all_examples.sort();
-    Ok(TestTargets { lib: m.lib.as_ref().map(|l| LibTarget { path: l.path.clone(), test: l.test, doctest: l.doctest }), bins, tests, examples, all_examples })
+        out.sort();
+        Ok(out)
+    };
+    let all_bins = every(&m.bins)?;
+    let all_examples = every(&m.examples)?;
+    Ok(TestTargets { lib: m.lib.as_ref().map(|l| LibTarget { path: l.path.clone(), test: l.test, doctest: l.doctest }), bins, tests, examples, all_bins, all_examples })
 }
 
 /// A package's targets as `cargo test` selects them (`test_targets`): the lib, and (name, source
@@ -1233,6 +1238,9 @@ pub struct TestTargets {
     pub bins: Vec<(String, String, bool)>,
     pub tests: Vec<(String, String, bool)>,
     pub examples: Vec<(String, String, bool)>,
+    /// every bin whose required features are on, `test = false` ones too: what cargo builds
+    /// beside an integration test (its CARGO_BIN_EXE_<name>)
+    pub all_bins: Vec<(String, String, bool)>,
     /// every example whose required features are on (`--examples`, cargo's "all example targets")
     pub all_examples: Vec<(String, String, bool)>,
 }
