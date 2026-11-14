@@ -2320,6 +2320,21 @@ pub struct BuildRoot {
 /// The use locks this process holds (shared locks on `<build dir>/relax-use`), kept for its life.
 static USE_LOCKS: Mutex<Vec<(std::path::PathBuf, std::fs::File)>> = Mutex::new(Vec::new());
 
+/// Whether open file `f` is the file at `path` now (not one removed and replaced). Windows does
+/// not remove a file another holds open, so there it always is.
+fn is_file_at(f: &std::fs::File, path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        f.metadata().ok().zip(std::fs::metadata(path).ok()).is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (f, path);
+        true
+    }
+}
+
 fn build_lock(build: &std::path::Path, wait: bool) -> Option<std::fs::File> {
     let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(build.join("lock")).ok()?;
     let locked = if wait { f.lock().is_ok() } else { f.try_lock().is_ok() };
@@ -2384,9 +2399,13 @@ impl BuildRoot {
             }
         }
         let _ = std::fs::create_dir_all(&dir);
+        let use_file = dir.join("relax-use");
         let mut locks = USE_LOCKS.lock().unwrap();
+        // a lock on a file no longer at its path holds nothing: the dir was removed outside the
+        // prune and made again (a test run again in one process, a clean), so the new file is locked
+        locks.retain(|(p, f)| *p != dir || is_file_at(f, &use_file));
         if !locks.iter().any(|(p, _)| *p == dir) {
-            if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("relax-use")) {
+            if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&use_file) {
                 let _ = f.lock_shared();
                 crate::zone_alloc::kept_with(|| locks.push((dir.clone(), f)));
             }
@@ -2793,7 +2812,8 @@ mod shared_script_tests {
     /// `build/` keeps what the roots name: a pass names each build dir in its root before it uses
     /// it and leaves the root naming exactly what it took; the prune removes what no root names and
     /// no run holds, the root of a checkout that is gone with what only it named, and keeps a base
-    /// dir while one of its outputs stays; it does nothing while another holds the build lock.
+    /// dir while one of its outputs stays; it does nothing while another holds the build lock. A
+    /// held dir made again is locked again (the test run twice in one process failed on that).
     #[test]
     fn the_build_prune_keeps_what_the_roots_name() {
         let base = scratch("prune");
@@ -2837,6 +2857,13 @@ mod shared_script_tests {
         let mut roots_left: Vec<String> = std::fs::read_dir(&roots).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         roots_left.retain(|n| n.len() != 32);
         assert_eq!(roots_left, ["other"], "a gone checkout's root and a stale root write go");
+        // a held dir removed outside the prune and made again (this test run again in one process,
+        // which makes its scratch folder anew): the next take use-locks the new one
+        let held = build.join("held-0123456789abcdef");
+        std::fs::remove_dir_all(&held).unwrap();
+        BuildRoot::at(build.clone(), ck.clone(), &["run"]).take("held-0123456789abcdef");
+        let use_file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(held.join("relax-use")).unwrap();
+        assert!(use_file.try_lock().is_err(), "a build dir made again is use-locked again");
         std::fs::remove_dir_all(&base).unwrap();
     }
 }
