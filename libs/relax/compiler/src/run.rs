@@ -4356,9 +4356,8 @@ static DONE: AtomicBool = AtomicBool::new(false);
 
 fn finish_run(why: &'static str, code: Option<i32>) {
     jit::exec_check();
-    crate::borrowck::lazy::stop();
-    let Some(exit) = EXIT_SUMMARY.get() else { return };
-    if DONE.swap(true, Ordering::AcqRel) { return; }
+    let Some(exit) = EXIT_SUMMARY.get() else { crate::borrowck::lazy::stop(); return };
+    if DONE.swap(true, Ordering::AcqRel) { crate::borrowck::lazy::stop(); return; }
     // ending on the owner thread itself (an initializer's process::exit): it cannot serve the
     // exit worker while it waits for it
     EXIT_CALLER_HOLDS.store(crate::owner::is_owner(), Ordering::SeqCst);
@@ -4375,6 +4374,11 @@ fn finish_run(why: &'static str, code: Option<i32>) {
         }
         verbose!("relax quit: the quit write's last passes before the exit took {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
     }
+    // the background borrow checks stop after the quit write: their stop ends every preemptible
+    // step (preempt::stop_all), and from then on the cache makes no slot key -- a last pass that
+    // ran after it kept the startup manifest of the run's first seconds (record_manifest), so the
+    // next launch linked the rest of the session on the UI thread at each first call
+    crate::borrowck::lazy::stop();
     jit::begin_exit();
     jit::solver_work_report_at_exit();
     // a JIT thread that panicked during the run is said once more at its end (inspect threads has the rows)
@@ -4593,6 +4597,13 @@ static QUIT_WRITE_RUNNING: AtomicBool = AtomicBool::new(false);
 /// finish_run waits for the quit write: its passes come back to back, and the first whole one is
 /// its last.
 static QUIT_WRITE_FINISHING: AtomicBool = AtomicBool::new(false);
+/// A write's manifest and crate records give the owner back to a waiting request -- except in the
+/// quit write's last passes, which the exit waits for once the window is gone: a request then is
+/// the end of a thread that outlives the window, and a pass that gave way to it was followed by the
+/// exit, the whole session's manifest dropped.
+fn quit_write_gives_way() -> bool {
+    !QUIT_WRITE_FINISHING.load(Ordering::SeqCst) && crate::owner::request_waiting()
+}
 /// Ends QUIT_WRITE_RUNNING when the quit write's thread ends, however it ends.
 struct QuitWriteEnds;
 impl Drop for QuitWriteEnds {
@@ -4885,7 +4896,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             if let Some(c) = cache.as_mut() {
                 // a waiting request (a frame's lazy compile, a live patch, a back end's Job) goes
                 // first: the manifest is made again by a later write
-                let stop = || { probe.tick("manifest"); crate::owner::request_waiting() };
+                let stop = || { probe.tick("manifest"); quit_write_gives_way() };
                 if !c.record_manifest(u, crate::layout::root_crate(), &order, present, &stop) {
                     MID_MANIFEST_DONE.store(false, Ordering::Relaxed);
                     mid_yielded();
@@ -4910,7 +4921,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             parts[1] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("crate records");
             probe.tick("front images");
-            let stop = || { probe.tick("crate records"); crate::owner::request_waiting() };
+            let stop = || { probe.tick("crate records"); quit_write_gives_way() };
             let complete = c.record_front_crates_until(&u.prog, &stop);
             parts[2] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("spill take");
