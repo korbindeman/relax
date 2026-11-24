@@ -57,6 +57,15 @@ pub fn check_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A git dependency's URL: one Relax fetches, or an ssh one it only reads from local stores.
+pub fn check_source_url(url: &str) -> Result<(), String> {
+    if url.starts_with("ssh://") { Ok(()) } else { check_url(url) }
+}
+
+fn check_fetchable(url: &str, what: &str) -> Result<(), String> {
+    check_url(url).map_err(|_| format!("{url}: {what} is not in Cargo's git stores, and Relax does not fetch over ssh: run `cargo fetch`"))
+}
+
 impl Repo {
     pub fn parse(s: &str) -> Result<Repo, String> {
         let (s, commit) = match s.rsplit_once('@') {
@@ -360,7 +369,7 @@ fn is_hex(s: &str) -> bool {
 /// Unlocked: the commit the remote's ref names now, fetched unless the store holds it; with the
 /// remote unreachable or offline the store's newest fetch of the ref, said so.
 pub fn fetch_source(cache: &Path, url: &str, r: &GitRef, locked: Option<Oid>, offline: bool) -> Result<Oid, String> {
-    check_url(url)?;
+    check_source_url(url)?;
     let path = store::store_path(cache, url);
     let existing = store::Store::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let (name, key) = (r.key(), stored_key(url, &r.key()));
@@ -378,11 +387,12 @@ pub fn fetch_source(cache: &Path, url: &str, r: &GitRef, locked: Option<Oid>, of
         }
         if super::cargo::import(&home, url, c, &path, &key)? { return Ok(c); }
         if offline { return Err(super::cargo::missing(&home, url, &store::hex(&c))); }
+        check_fetchable(url, &store::hex(&c))?;
         let adv = advertisement(url).map_err(|e| format!("{url}: the locked commit {} is not in the store and the remote is unreachable: {e}", store::hex(&c)))?;
         fetch_commit(&path, existing.as_ref(), url, &adv, c, &key)?;
         return Ok(c);
     }
-    let adv = match if offline { Err(super::cargo::missing(&home, url, &name)) } else { advertisement(url) } {
+    let adv = match if offline { Err(super::cargo::missing(&home, url, &name)) } else { check_fetchable(url, &name).and_then(|()| advertisement(url)) } {
         Ok(a) => a,
         Err(e) => {
             // a commit id (or an abbreviation of one) the store holds needs no remote; a ref is the
@@ -516,4 +526,19 @@ mod tests {
         assert_eq!(newest(&s, ours, "HEAD"), Some(own), "a ref never fetched takes this URL's newest fetch, never another URL's newer one");
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn an_ssh_source_is_never_fetched() {
+    let cache = std::env::temp_dir().join(format!("relax-ssh-source-{}", std::process::id()));
+    let url = "ssh://git@relax.invalid/team/project.git";
+    let commit = store::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap();
+    let rev = GitRef::Rev(store::hex(&commit));
+    for (r, locked) in [(&rev, Some(commit)), (&GitRef::DefaultBranch, None)] {
+        let e = fetch_source(&cache, url, r, locked, false).unwrap_err();
+        assert!(e.contains(url) && e.contains("`cargo fetch`"), "{e}");
+    }
+    assert!(fetch_source(&cache, "git@relax.invalid:team/project", &rev, Some(commit), false).unwrap_err().contains("not an https"));
+    let _ = std::fs::remove_dir_all(&cache);
 }

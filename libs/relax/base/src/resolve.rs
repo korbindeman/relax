@@ -47,7 +47,7 @@
 //!   `[package]` of that name; `workspace = true` fields inherit from the repository's own
 //!   workspace; a path dependency inside the repository is part of the same git source. Package
 //!   ids are cargo's `git+<url>[?<ref>]#<name>@<version>`.
-//! Unsupported (an error naming it): ssh and file git URLs, registry packages missing from the vendored
+//! Unsupported (an error naming it): fetching over ssh (an `ssh://` source is read from local stores), file git URLs, registry packages missing from the vendored
 //! directory (never looked up anywhere else, never fetched, then), registry packages that compile C
 //! (a cc/cmake build-dependency), unknown command-line flags.
 
@@ -209,8 +209,8 @@ fn git_src(st: &TomlTable, at: &str, key: &str) -> Result<Option<GitSrc>, String
     if refs.len() > 1 {
         return Err(format!("{}: dependency ({}) specification is ambiguous. Only one of `branch`, `tag` or `rev` is allowed.", at, key));
     }
-    if crate::git::fetch::check_url(&url).is_err() {
-        return Err(format!("{}: `{}` is a git dependency on {}: Relax fetches git repositories over https only", at, key, url));
+    if crate::git::fetch::check_source_url(&url).is_err() {
+        return Err(format!("{}: `{}` is a git dependency on {}: Relax fetches git repositories over https only, and reads ssh:// ones from Cargo's stores", at, key, url));
     }
     Ok(Some(GitSrc { url, reference: refs.pop().unwrap_or(GitRef::DefaultBranch) }))
 }
@@ -3954,6 +3954,8 @@ fn git_sources_as_cargo_spells_them() {
     assert!(git_src(&t("git = \"https://h/r\"\nbranch = \"a\"\ntag = \"b\"\n"), "x", "d").is_err());
     assert!(git_src(&t("git = \"https://h/r\"\npath = \"p\"\n"), "x", "d").is_err());
     assert!(git_src(&t("git = \"git@github.com:a/b\"\n"), "x", "d").unwrap_err().contains("https only"));
+    assert_eq!(git_src(&t("git = \"ssh://git@github.com/a/b.git\"\nrev = \"abc\"\n"), "x", "d").unwrap().unwrap().url, "ssh://git@github.com/a/b.git");
+    assert!(git_src(&t("git = \"file:///a/b\"\n"), "x", "d").is_err());
     assert_eq!(git_src(&t("git = \"https://h/r\"\ntag = \"v1\"\n"), "x", "d").unwrap().unwrap().reference, GitRef::Tag("v1".into()));
     // cargo's package discovery: root first, depth-first by name; hidden folders, target folders
     // beside a manifest and nested repositories skipped
