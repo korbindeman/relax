@@ -1124,12 +1124,10 @@ impl<'a> Res<'a> {
             return Some(self.crate_root(c));
         }
         if let Some(c) = self.table.crates.get(k).and_then(|c| c.externs.get(n)) {
-            // a bin naming its own package's lib (same crate name): the lib, not itself
-            if c == k {
-                let lib = format!("{}\u{1}lib", c);
-                if let Some((lib, _)) = self.table.crates.get_key_value(&lib) {
-                    return Some(self.crate_root(lib));
-                }
+            // a lib whose name a bin has taken: the lib, as no crate depends on a bin
+            let lib = format!("{}\u{1}lib", c);
+            if let Some((lib, _)) = self.table.crates.get_key_value(&lib) {
+                return Some(self.crate_root(lib));
             }
             return Some(self.crate_root(c));
         }
@@ -4416,6 +4414,28 @@ mod replay_tests {
             table.add_crate(name.into(), std::sync::Arc::new(cm));
         }
         table
+    }
+
+    /// Package `mid` has a bin named as the lib `foo` that its own lib depends on.
+    #[test]
+    fn a_bin_named_as_a_dependency_leaves_the_dependency_to_other_crates() {
+        let mut table = MacroTable::default();
+        for (name, src, externs) in [
+            ("foo", "foo/src/lib.rs", &[][..]),
+            ("mid", "mid/src/lib.rs", &["foo"][..]),
+            ("foo", "mid/src/main.rs", &["foo", "mid"][..]),
+        ] {
+            let mut cm = CrateMods { root: name.into(), src: src.into(), ..Default::default() };
+            cm.mods.insert(name.into());
+            for dep in externs { cm.externs.insert((*dep).into(), (*dep).into()); }
+            table.add_crate(name.into(), std::sync::Arc::new(cm));
+        }
+        let r = Res { table: &table };
+        for from in ["mid", "foo"] {
+            let (k, _) = r.extern_crate(from, "foo").unwrap();
+            assert_eq!(table.crates[k].src, "foo/src/lib.rs", "`foo` as `{from}` names it");
+        }
+        assert_eq!(r.extern_crate("foo", "mid").unwrap().0, "mid");
     }
 
     #[test]
